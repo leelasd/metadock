@@ -65,6 +65,7 @@ def main():
     mc_p.add_argument("-o", "--output", required=True, help="Output SDF file for docked poses")
     mc_p.add_argument("-s", "--steps", type=int, default=100, help="Number of Monte Carlo steps (default: 100)")
     mc_p.add_argument("-t", "--temperature", type=float, default=300.0, help="Monte Carlo simulation temperature in K (default: 300)")
+    mc_p.add_argument("-traj", "--trajectory", default=None, help="Optional output SDF path to save the complete multi-frame Monte Carlo trajectory")
     mc_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
     mc_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
 
@@ -215,6 +216,14 @@ def main():
             res = engine.dock_monte_carlo(lig, n_steps=args.steps, temperature_k=args.temperature)
             writer.write(res.mol)
             print(f"  Best Pose: Score = {res.score:.3f} (VDW: {res.scores['SCORE.INTER.VDW']:.2f}, Polar: {res.scores['SCORE.INTER.POLAR']:.2f})")
+
+            if getattr(args, "trajectory", None) and res.trajectory:
+                traj_path = Path(args.trajectory)
+                traj_writer = Chem.SDWriter(str(traj_path))
+                for frame in res.trajectory:
+                    traj_writer.write(frame)
+                traj_writer.close()
+                print(f"[✓] Complete {len(res.trajectory)}-frame Monte Carlo trajectory written to {traj_path}")
 
     writer.close()
     print(f"[✓] Results written to {out_path}")

@@ -47,6 +47,7 @@ class DockingResult:
     score: float
     scores: Dict[str, float]
     run_idx: int = 0
+    trajectory: Optional[List[Chem.Mol]] = None
 
 
 class DockingEngine:
@@ -656,6 +657,16 @@ class DockingEngine:
             best_energy = curr_energy
             best_scores = self._extract_decomposed_scores(context)
 
+            # Record trajectory frames
+            trajectory_frames: List[Chem.Mol] = []
+            f0 = copy.deepcopy(curr_mol)
+            f0.SetProp("MC_FRAME", "0")
+            f0.SetProp("MOVE_TYPE", "INITIAL")
+            f0.SetProp("ACCEPTED", "1")
+            f0.SetProp("ENERGY", f"{curr_energy:.4f}")
+            f0.SetProp("BEST_ENERGY", f"{best_energy:.4f}")
+            trajectory_frames.append(f0)
+
             from scipy.spatial.transform import Rotation as ScipyRotation
             beta = 1.0 / (0.001987 * temperature_k)
 
@@ -703,7 +714,9 @@ class DockingEngine:
                 trial_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) / 4.184
                 delta_e = trial_energy - curr_energy
 
-                if delta_e <= 0.0 or random.random() < math.exp(- beta * delta_e):
+                is_accepted = (delta_e <= 0.0 or random.random() < math.exp(- beta * delta_e))
+
+                if is_accepted:
                     curr_energy = trial_energy
                     curr_mol = self._update_ligand_conformer(trial_mol, state.getPositions(), lig_start, lig_n)
                     curr_coords = np.array([curr_mol.GetConformer().GetAtomPosition(i) for i in range(lig_n)])
@@ -713,6 +726,17 @@ class DockingEngine:
                         best_mol = copy.deepcopy(curr_mol)
                         best_scores = self._extract_decomposed_scores(context)
 
+                # Record frame in trajectory
+                frame_mol = copy.deepcopy(curr_mol)
+                frame_mol.SetProp("MC_FRAME", str(step + 1))
+                frame_mol.SetProp("MOVE_TYPE", move_type.upper())
+                frame_mol.SetProp("ACCEPTED", "1" if is_accepted else "0")
+                frame_mol.SetProp("ENERGY", f"{curr_energy:.4f}")
+                frame_mol.SetProp("TRIAL_ENERGY", f"{trial_energy:.4f}")
+                frame_mol.SetProp("DELTA_E", f"{delta_e:.4f}")
+                frame_mol.SetProp("BEST_ENERGY", f"{best_energy:.4f}")
+                trajectory_frames.append(frame_mol)
+
             for k, v in best_scores.items():
                 best_mol.SetProp(k, f"{v:.4f}")
 
@@ -721,6 +745,7 @@ class DockingEngine:
                 score=best_scores["SCORE"],
                 scores=best_scores,
                 run_idx=1,
+                trajectory=trajectory_frames,
             )
         finally:
             del context, integrator
