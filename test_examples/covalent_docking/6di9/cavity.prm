@@ -5,13 +5,13 @@ RECEPTOR_FILE receptor.pdb
 RECEPTOR_FLEX 3.0
 
 ##################################################################
-### CAVITY DEFINITION: COVALENT BINDING POCKET
+### CAVITY DEFINITION: TRUE BTK ATP-BINDING POCKET
 ##################################################################
 SECTION CAVITY
     SCORING_FUNCTION    RbtCavityGridSF
     WEIGHT              1.0
-    CENTER              (-22.21, 7.42, 0.91)
-    RADIUS              15.0
+    CENTER              (-12.16, 4.01, 0.43)
+    RADIUS              22.0
     GRID                0.5
     QUAD_ALL            TRUE
 END_SECTION
