@@ -1,0 +1,14 @@
+RBT_PARAMETER_FILE_V1.00
+TITLE Keap1_Macrocycle_6Z6A_Q9E
+
+RECEPTOR_FILE receptor.pdb
+RECEPTOR_FLEX 3.0
+
+SECTION CAVITY
+    SCORING_FUNCTION    RbtCavityGridSF
+    WEIGHT              1.0
+    CENTER              (-21.46, 22.44, -24.18)
+    RADIUS              15.0
+    GRID                0.5
+    QUAD_ALL            TRUE
+END_SECTION

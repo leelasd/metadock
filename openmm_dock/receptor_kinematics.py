@@ -254,3 +254,16 @@ class ReceptorSideChainKinematics:
             lines_out.append(line_mod)
         lines_out.append("END")
         Path(out_path).write_text("\n".join(lines_out) + "\n")
+
+    def write_multi_model_trajectory(self, trajectory_coords: List[np.ndarray], out_path: Path | str):
+        """Writes a series of receptor conformations as a multi-model PDB movie."""
+        lines_out = []
+        for model_idx, coords in enumerate(trajectory_coords, start=1):
+            lines_out.append(f"MODEL     {model_idx:4d}")
+            for idx, l in enumerate(self.atom_lines):
+                x, y, z = coords[idx]
+                line_mod = f"{l[:30]}{x:8.3f}{y:8.3f}{z:8.3f}{l[54:]}"
+                lines_out.append(line_mod)
+            lines_out.append("ENDMDL")
+        lines_out.append("END")
+        Path(out_path).write_text("\n".join(lines_out) + "\n")
