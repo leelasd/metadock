@@ -90,3 +90,25 @@ We also provide a full receptor side-chain kinematic exploration movie for Keap1
 python run_keap1_sidechain_kinematics.py
 pymol visualize_keap1_sidechains_pymol.pml
 ```
+
+---
+
+## 6. Grand Unified Kinematic PSO (Macrocycle IK + Side-Chain FK + Receptor $\chi_1\text{--}\chi_4$)
+
+We combine all paradigms into a single **Grand Unified Kinematic PSO Engine**:
+
+```
+                               GRAND UNIFIED KINEMATIC PSO
+                               
+   Coupled 48-Dimensional State Vector:
+   
+   S = [ Translation (3) | Rotation (3) | Ring IK Drivers (2) | Exocyclic FK (9) | Receptor Chi (31) ]
+```
+
+* **Coupled Multi-Track Trajectory:** Generates a synchronized **225-frame movie** where the 16-membered macrocycle swarm flies and breathes while the Keap1 Arginine pocket triad (`Arg-415`, `Arg-483`, `Arg-380`) dynamically flexes its $\chi_1\text{--}\chi_4$ side-chain arms to clasp the ligand in real time!
+
+### Run & View Grand Unified Kin-PSO:
+```bash
+python run_unified_pso_demo.py
+pymol visualize_unified_pso_pymol.pml
+```
