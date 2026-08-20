@@ -39,6 +39,7 @@ from .pharmacophore import (
     parse_pharma_restr,
     create_pharmacophore_restraint_forces,
     align_ligand_to_pharmacophore,
+    find_ligand_pharma_features,
 )
 from .tether import (
     TetherConstraint,
@@ -156,6 +157,57 @@ def decode_chromosome(
     centered = coords - centroid
     rot_mat = ScipyRotation.from_euler("xyz", euler, degrees=True).as_matrix()
     return cavity_center + trans + centered.dot(rot_mat.T)
+
+
+def encode_chromosome(
+    coords: np.ndarray,
+    base_local_coords: np.ndarray,
+    torsion_dofs: List[Dict[str, Any]],
+    cavity_center: np.ndarray,
+) -> np.ndarray:
+    """
+    Inverse of decode_chromosome: given actual Cartesian ligand coordinates
+    (e.g. the result of a Cartesian local minimization), recovers the
+    chromosome that would decode to (approximately) those coordinates. This
+    is what makes local search *Lamarckian* rather than Baldwinian -- a
+    locally-optimized phenotype can be written back into the genotype and
+    inherited by future generations/proposals, instead of the improvement
+    being discarded the moment fitness is scored (AutoDock's LGA does this
+    via Solis-Wets local search operating directly in genotype space; we get
+    the same effect by re-deriving the genotype via Kabsch alignment after a
+    Cartesian minimization).
+
+    Torsions are read directly off the actual coordinates (real dihedral
+    measurements). The 6 rigid-body genes are recovered by first replaying
+    those torsions onto base_local_coords (reproducing decode_chromosome's
+    torsion-only intermediate, centered at the origin), then finding the
+    rotation + translation that best superimposes that intermediate onto the
+    actual coordinates (Kabsch algorithm) -- the same superposition method
+    already used by pharmacophore.align_ligand_to_pharmacophore.
+    """
+    n_t = len(torsion_dofs)
+    torsions = np.array([
+        _dihedral_deg(coords[d["ref0"]], coords[d["a1"]], coords[d["a2"]], coords[d["ref3"]])
+        for d in torsion_dofs
+    ])
+
+    zero_chrom = np.concatenate([np.zeros(3), np.zeros(3), torsions])
+    intermediate = decode_chromosome(zero_chrom, base_local_coords, torsion_dofs, np.zeros(3))
+
+    q_centroid = coords.mean(axis=0)
+    trans = q_centroid - cavity_center
+
+    P = intermediate  # already centered at the origin by construction above
+    Q = coords - q_centroid
+    H = P.T @ Q
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    euler = ScipyRotation.from_matrix(R).as_euler("xyz", degrees=True)
+    return np.concatenate([trans, euler, torsions])
 
 
 def tournament_select(
@@ -296,7 +348,11 @@ class DockingEngine:
         return aligned_mol, restraint
 
     def _resolve_covalent_rotation(
-        self, ligand_mol: Chem.Mol, restraint: CovalentRestraint, n_candidates: int = 24
+        self,
+        ligand_mol: Chem.Mol,
+        restraint: CovalentRestraint,
+        n_candidates: int = 24,
+        pharma_weight: float = 15.0,
     ) -> Chem.Mol:
         """
         prealign_ligand_for_covalent_docking fixes 5 of the ligand's 6 rigid-body
@@ -305,13 +361,21 @@ class DockingEngine:
         arbitrary. That single remaining DOF is exactly what determines
         whether the rest of the ligand swings into open space or straight
         into the receptor -- and it's cheap to resolve directly (1-D grid
-        search over a crude steric clash score against nearby receptor atoms)
-        rather than hoping a generic search protocol's small step sizes
-        stumble onto a clash-free angle. AutoDock's GA instead treats this as
-        just another torsion-tree DOF explored by the full population search;
-        since ours are local-refinement (see dock_genetic_algorithm), we
-        resolve it once, up front, the same way a real user would pick a
+        search) rather than hoping a generic search protocol's small step
+        sizes stumble onto a clash-free angle. AutoDock's GA instead treats
+        this as just another torsion-tree DOF explored by the full population
+        search; since ours are local-refinement (see dock_genetic_algorithm),
+        we resolve it once, up front, the same way a real user would pick a
         starting rotamer.
+
+        When self.pharma_points is set, candidates are scored on steric clash
+        *and* pharmacophore-feature proximity. This is the useful synergy with
+        covalent docking: the covalent bond already pins 5 of 6 DOFs to near
+        machine precision, so pharmacophore points no longer need the normal
+        3-point minimum to fully resolve orientation (see
+        pharmacophore.align_ligand_to_pharmacophore, which needs >=3 points
+        for its independent Kabsch fit) -- a single point can be enough to
+        break the one remaining rotational ambiguity here.
         """
         conf = ligand_mol.GetConformer()
         coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
@@ -329,16 +393,30 @@ class DockingEngine:
         if rec_near.shape[0] == 0:
             return ligand_mol
 
+        pharma_features = find_ligand_pharma_features(ligand_mol) if self.pharma_points else {}
+
         best_angle_rad = 0.0
-        best_clash = float("inf")
+        best_score = float("inf")
         for angle_deg in np.linspace(0.0, 360.0, n_candidates, endpoint=False):
             angle_rad = math.radians(angle_deg)
             rot = ScipyRotation.from_rotvec(angle_rad * axis)
             trial = el_pos + rot.apply(coords - el_pos)
             d = np.linalg.norm(trial[:, None, :] - rec_near[None, :, :], axis=2)
             clash = float(np.sum(np.clip(3.0 - d, 0.0, None) ** 2))
-            if clash < best_clash:
-                best_clash = clash
+
+            pharma_penalty = 0.0
+            for p in self.pharma_points:
+                feats = pharma_features.get(p.ptype, [])
+                if not feats:
+                    continue
+                best_feat_d = min(
+                    float(np.linalg.norm(trial[feat].mean(axis=0) - p.coords)) for feat in feats
+                )
+                pharma_penalty += best_feat_d ** 2
+
+            total = clash + pharma_weight * pharma_penalty
+            if total < best_score:
+                best_score = total
                 best_angle_rad = angle_rad
 
         rot = ScipyRotation.from_rotvec(best_angle_rad * axis)
@@ -880,83 +958,166 @@ class DockingEngine:
         t_low: float = 10.0,
         anneal_steps: int = 10,
         steps_per_temp: int = 100,
+        trans_sigma: float = 1.0,
+        rot_sigma: float = 25.0,
+        torsion_sigma: float = 35.0,
+        lamarck_interval: int = 25,
+        lamarck_iterations: int = 15,
         seed: int = 42,
     ) -> List[DockingResult]:
-        """GPU-accelerated Simulated Annealing Molecular Dynamics (SAMD) Docking."""
-        random.seed(seed)
-        np.random.seed(seed)
+        """
+        Chromosome-space Simulated Annealing docking (AutoDock-style): discrete
+        Metropolis moves over the same rigid-body + torsion chromosome
+        dock_genetic_algorithm uses, with a cooling temperature schedule --
+        not literal MD integration.
 
-        # If pharmacophore points exist and no tether, align ligand to pharmacophore before building system
+        Why not literal MD: this used to run real Langevin dynamics
+        (LangevinMiddleIntegrator, 1fs timestep) starting from a randomized
+        pose. A randomized orientation frequently starts with a severe steric
+        clash, and integrating that against 500,000 kJ/(mol*nm^2) valence
+        bond springs at 800K is a classic MD instability -- large initial
+        forces can blow the integration up rather than anneal away from it
+        (empirically: 10/10 blind runs on a simple test system ended in
+        unphysical positive energies, regardless of search-box size). A
+        discrete chromosome-space proposal can never do this: a rotation/
+        translation/torsion change is always a chemically valid rigid-body
+        configuration -- there's nothing to integrate, only a score to
+        evaluate and a Metropolis accept/reject decision to make. This
+        mirrors AutoDock, which never runs literal dynamics either.
+
+        Also Lamarckian (AutoDock LGA-style), like dock_genetic_algorithm:
+        every `lamarck_interval` accepted-or-not moves, the current
+        chromosome is locally minimized and re-encoded (encode_chromosome),
+        so within-run local optimization actually compounds instead of being
+        immediately perturbed away by the next proposal.
+        """
+        rng = np.random.default_rng(seed)
+
         if self.pharma_points and not tether_constraints:
             ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
 
         ligand_mol, covalent_restraint = self._prepare_covalent(ligand_mol)
 
-        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint)
+        torsion_dofs = identify_torsion_dofs(ligand_mol)
+        n_t = len(torsion_dofs)
+
+        conf = ligand_mol.GetConformer()
+        base_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
+        base_local = base_coords - base_coords.mean(axis=0)
+
+        input_torsions = [
+            _dihedral_deg(base_coords[d["ref0"]], base_coords[d["a1"]], base_coords[d["a2"]], base_coords[d["ref3"]])
+            for d in torsion_dofs
+        ]
+        input_centroid_offset = base_coords.mean(axis=0) - self.cavity.center
+        input_chrom = np.concatenate([input_centroid_offset, [0.0, 0.0, 0.0], input_torsions])
+
+        # Pharma/tether/covalent guidance already pins down (most of) the rigid-body
+        # placement, so each run only needs to jitter around it, same as
+        # dock_genetic_algorithm's local refinement. Otherwise, this is genuinely
+        # blind global search: fully random orientation, small random offset from
+        # the cavity center (position is unconstrained beyond "somewhere in the
+        # defined pocket").
+        guided = bool(self.pharma_points or tether_constraints or covalent_restraint is not None)
+
+        # Two systems: a cheap single-force system for the O(runs x anneal_steps x
+        # steps_per_temp) inner search loop, and the real decomposed-score system
+        # used only once per run (for the winning pose) so reported SCORE.INTER.*
+        # fields stay genuine.
+        search_system, _, lig_start, lig_n = self._build_system(
+            ligand_mol, tether_constraints, covalent_restraint, fast_search=True
+        )
+        search_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        context = (
+            mm.Context(search_system, search_integrator, self.platform)
+            if self.platform
+            else mm.Context(search_system, search_integrator)
+        )
+
+        report_system, _, _, _ = self._build_system(
+            ligand_mol, tether_constraints, covalent_restraint, fast_search=False
+        )
+        report_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        report_context = (
+            mm.Context(report_system, report_integrator, self.platform)
+            if self.platform
+            else mm.Context(report_system, report_integrator)
+        )
+
+        R_GAS_KJ = 0.0083145  # kJ/(mol*K)
+
+        def decode(chrom: np.ndarray) -> np.ndarray:
+            return decode_chromosome(chrom, base_local, torsion_dofs, self.cavity.center)
+
+        def energy_of(chrom: np.ndarray) -> float:
+            coords = decode(chrom)
+            context.setPositions(self._full_positions_from_coords(coords))
+            return context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+
+        def lamarck(chrom: np.ndarray) -> Tuple[float, np.ndarray]:
+            coords = decode(chrom)
+            context.setPositions(self._full_positions_from_coords(coords))
+            mm.LocalEnergyMinimizer.minimize(
+                context,
+                tolerance=1.0 * (unit.kilojoules_per_mole / unit.nanometer),
+                maxIterations=lamarck_iterations,
+            )
+            state = context.getState(getPositions=True, getEnergy=True)
+            energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+            minimized = np.array(state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)) * 10.0
+            lig_coords = minimized[lig_start:lig_start + lig_n]
+            new_chrom = encode_chromosome(lig_coords, base_local, torsion_dofs, self.cavity.center)
+            return energy, new_chrom
+
         results: List[DockingResult] = []
+        try:
+            for run in range(n_runs):
+                if guided:
+                    chrom = mutate_chromosome(
+                        rng, input_chrom, mutation_rate=1.0, n_torsions=n_t,
+                        trans_sigma=0.5, rot_sigma=15.0, torsion_sigma=20.0,
+                    )
+                else:
+                    trans = rng.uniform(-1.5, 1.5, size=3)
+                    euler = ScipyRotation.random(random_state=rng).as_euler("xyz", degrees=True)
+                    chrom = np.concatenate([trans, euler, input_torsions])
 
-        for run in range(n_runs):
-            mol_rand = copy.deepcopy(ligand_mol)
-            if self.pharma_points or tether_constraints or covalent_restraint is not None:
-                # Pharmacophore-constrained or Tethered docking: sample around aligned pose with rotational/translational jitter
-                from scipy.spatial.transform import Rotation as ScipyRotation
-                angles = np.random.uniform(-15.0, 15.0, size=3)
-                rot_mat = ScipyRotation.from_euler("xyz", angles, degrees=True).as_matrix()
-                trans = np.random.uniform(-0.5, 0.5, size=3)
-                conf = mol_rand.GetConformer()
-                coords = np.array([conf.GetAtomPosition(j) for j in range(mol_rand.GetNumAtoms())])
-                mean_p = np.mean(coords, axis=0)
-                centered = coords - mean_p
-                rotated = np.dot(centered, rot_mat.T)
-                new_coords = mean_p + rotated + trans
-                for i in range(mol_rand.GetNumAtoms()):
-                    conf.SetAtomPosition(i, (float(new_coords[i, 0]), float(new_coords[i, 1]), float(new_coords[i, 2])))
-            else:
-                # Unconstrained docking: full rigid-body 3D rotation (SO3) and translation into cavity
-                from scipy.spatial.transform import Rotation as ScipyRotation
-                rot_mat = ScipyRotation.random().as_matrix()
-                trans = np.random.uniform(-1.5, 1.5, size=3)
-                conf = mol_rand.GetConformer()
-                center = self.cavity.center
-                lig_atoms_count = mol_rand.GetNumAtoms()
-                coords = np.array([conf.GetAtomPosition(j) for j in range(lig_atoms_count)])
-                mean_p = np.mean(coords, axis=0)
-                centered = coords - mean_p
-                rotated = np.dot(centered, rot_mat.T)
-                new_coords = center + rotated + trans
-                for i in range(lig_atoms_count):
-                    conf.SetAtomPosition(i, (float(new_coords[i, 0]), float(new_coords[i, 1]), float(new_coords[i, 2])))
+                energy = energy_of(chrom)
 
-            integrator = mm.LangevinMiddleIntegrator(
-                t_high * unit.kelvin,
-                2.0 / unit.picoseconds,
-                1.0 * unit.femtoseconds,
-            )
-            context = (
-                mm.Context(system, integrator, self.platform)
-                if self.platform
-                else mm.Context(system, integrator)
-            )
-
-            try:
-                context.setPositions(self._get_system_positions(mol_rand))
-
-                # Annealing schedule
                 temps = np.linspace(t_high, t_low, num=anneal_steps)
+                move_count = 0
                 for t in temps:
-                    integrator.setTemperature(t * unit.kelvin)
-                    integrator.step(steps_per_temp)
+                    beta = 1.0 / (R_GAS_KJ * max(t, 1.0))
+                    for _ in range(steps_per_temp):
+                        trial = mutate_chromosome(
+                            rng, chrom, mutation_rate=1.0, n_torsions=n_t,
+                            trans_sigma=trans_sigma, rot_sigma=rot_sigma, torsion_sigma=torsion_sigma,
+                        )
+                        trial_energy = energy_of(trial)
+                        delta = trial_energy - energy
+                        if delta <= 0.0 or rng.random() < math.exp(-beta * delta):
+                            chrom, energy = trial, trial_energy
 
-                # Local Minimization
+                        move_count += 1
+                        if lamarck_interval > 0 and move_count % lamarck_interval == 0:
+                            energy, chrom = lamarck(chrom)
+
+                best_coords = decode(chrom)
+                mol_variant = copy.deepcopy(ligand_mol)
+                vconf = mol_variant.GetConformer()
+                for i in range(lig_n):
+                    p = best_coords[i]
+                    vconf.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
+
+                report_context.setPositions(self._full_positions_from_coords(best_coords))
                 mm.LocalEnergyMinimizer.minimize(
-                    context,
+                    report_context,
                     tolerance=0.1 * (unit.kilojoules_per_mole / unit.nanometer),
                     maxIterations=500,
                 )
-
-                state = context.getState(getPositions=True, getEnergy=True)
-                scores = self._extract_decomposed_scores(context, mol_rand)
-                docked_mol = self._update_ligand_conformer(mol_rand, state.getPositions(), lig_start, lig_n)
+                state = report_context.getState(getPositions=True, getEnergy=True)
+                scores = self._extract_decomposed_scores(report_context, mol_variant)
+                docked_mol = self._update_ligand_conformer(mol_variant, state.getPositions(), lig_start, lig_n)
 
                 for k, v in scores.items():
                     docked_mol.SetProp(k, f"{v:.4f}")
@@ -969,8 +1130,9 @@ class DockingEngine:
                         run_idx=run + 1,
                     )
                 )
-            finally:
-                del context, integrator
+        finally:
+            del context, search_integrator
+            del report_context, report_integrator
 
         results.sort(key=lambda r: r.score)
         return results
@@ -1234,7 +1396,16 @@ class DockingEngine:
         def decode(chrom: np.ndarray) -> np.ndarray:
             return decode_chromosome(chrom, base_local, torsion_dofs, self.cavity.center)
 
-        def fitness(chrom: np.ndarray) -> float:
+        def evaluate(chrom: np.ndarray) -> Tuple[float, np.ndarray]:
+            """
+            Lamarckian evaluation (AutoDock LGA-style): after the short local
+            minimization, the improved Cartesian result is re-encoded back into
+            the chromosome via encode_chromosome (Kabsch superposition), so the
+            improvement is inherited by future generations instead of being
+            discarded the moment fitness is scored (the previous Baldwinian
+            behavior -- minimize to *score* the individual, but keep evolving
+            the original, un-improved genotype).
+            """
             coords = decode(chrom)
             context.setPositions(self._full_positions_from_coords(coords))
             if fitness_minimize_iterations > 0:
@@ -1243,7 +1414,14 @@ class DockingEngine:
                     tolerance=1.0 * (unit.kilojoules_per_mole / unit.nanometer),
                     maxIterations=fitness_minimize_iterations,
                 )
-            return context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                state = context.getState(getPositions=True, getEnergy=True)
+                energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                minimized_coords = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer) * 10.0
+                lig_coords = np.array(minimized_coords[lig_start:lig_start + lig_n])
+                new_chrom = encode_chromosome(lig_coords, base_local, torsion_dofs, self.cavity.center)
+                return energy, new_chrom
+            energy = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+            return energy, chrom
 
         results: List[DockingResult] = []
         try:
@@ -1257,7 +1435,9 @@ class DockingEngine:
                     )
                     for _ in range(population_size - 1)
                 ]
-                scores = [fitness(c) for c in population]
+                evaluated = [evaluate(c) for c in population]
+                scores = [e for e, _ in evaluated]
+                population = [c for _, c in evaluated]
 
                 for gen in range(n_generations):
                     order = np.argsort(scores)
@@ -1275,8 +1455,9 @@ class DockingEngine:
                         )
                         new_population.append(child)
 
-                    population = new_population
-                    scores = [fitness(c) for c in population]
+                    evaluated = [evaluate(c) for c in new_population]
+                    scores = [e for e, _ in evaluated]
+                    population = [c for _, c in evaluated]
 
                 best_idx = int(np.argmin(scores))
                 best_chrom = population[best_idx]
