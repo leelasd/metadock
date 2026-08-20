@@ -31,6 +31,7 @@ from .pharmacophore import (
     PharmaPoint,
     parse_pharma_restr,
     create_pharmacophore_restraint_forces,
+    align_ligand_to_pharmacophore,
 )
 from .tether import (
     TetherConstraint,
@@ -466,13 +467,31 @@ class DockingEngine:
         random.seed(seed)
         np.random.seed(seed)
 
+        # If pharmacophore points exist and no tether, align ligand to pharmacophore before building system
+        if self.pharma_points and not tether_constraints:
+            ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
+
         system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints)
         results: List[DockingResult] = []
 
         for run in range(n_runs):
             mol_rand = copy.deepcopy(ligand_mol)
-            if not tether_constraints:
-                # Proper rigid-body 3D rotation (SO3) and translation into cavity
+            if self.pharma_points or tether_constraints:
+                # Pharmacophore-constrained or Tethered docking: sample around aligned pose with rotational/translational jitter
+                from scipy.spatial.transform import Rotation as ScipyRotation
+                angles = np.random.uniform(-15.0, 15.0, size=3)
+                rot_mat = ScipyRotation.from_euler("xyz", angles, degrees=True).as_matrix()
+                trans = np.random.uniform(-0.5, 0.5, size=3)
+                conf = mol_rand.GetConformer()
+                coords = np.array([conf.GetAtomPosition(j) for j in range(mol_rand.GetNumAtoms())])
+                mean_p = np.mean(coords, axis=0)
+                centered = coords - mean_p
+                rotated = np.dot(centered, rot_mat.T)
+                new_coords = mean_p + rotated + trans
+                for i in range(mol_rand.GetNumAtoms()):
+                    conf.SetAtomPosition(i, (float(new_coords[i, 0]), float(new_coords[i, 1]), float(new_coords[i, 2])))
+            else:
+                # Unconstrained docking: full rigid-body 3D rotation (SO3) and translation into cavity
                 from scipy.spatial.transform import Rotation as ScipyRotation
                 rot_mat = ScipyRotation.random().as_matrix()
                 trans = np.random.uniform(-1.5, 1.5, size=3)

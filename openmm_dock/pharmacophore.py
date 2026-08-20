@@ -163,3 +163,57 @@ def create_pharmacophore_restraint_forces(
             force.addParticle(sys_idx, [x0_nm, y0_nm, z0_nm, tol_nm, weight])
 
     return [force]
+
+
+def align_ligand_to_pharmacophore(mol: Chem.Mol, pharma_points: List[PharmaPoint]) -> Chem.Mol:
+    """
+    Superimposes the ligand's matching pharmacophore feature centers onto the target pharmacophore points
+    using a least-squares rigid-body Kabsch transformation.
+    """
+    mol_copy = Chem.Mol(mol)
+    conf = mol_copy.GetConformer()
+    features = find_ligand_pharma_features(mol_copy)
+
+    pt_coords = []
+    feat_coords = []
+    for p in pharma_points:
+        m_feats = features.get(p.ptype, [])
+        if not m_feats and p.ptype == "Aro":
+            ring_info = mol_copy.GetRingInfo()
+            m_feats = [list(r) for r in ring_info.AtomRings()]
+        if not m_feats:
+            continue
+
+        best_c = None
+        min_d = float("inf")
+        for f in m_feats:
+            fc = np.mean([conf.GetAtomPosition(a) for a in f], axis=0)
+            d = np.linalg.norm(fc - p.coords)
+            if d < min_d:
+                min_d = d
+                best_c = fc
+        if best_c is not None:
+            pt_coords.append(p.coords)
+            feat_coords.append(best_c)
+
+    if len(pt_coords) >= 3:
+        P = np.array(feat_coords)
+        Q = np.array(pt_coords)
+        centroid_P = np.mean(P, axis=0)
+        centroid_Q = np.mean(Q, axis=0)
+        P_c = P - centroid_P
+        Q_c = Q - centroid_Q
+        H = np.dot(P_c.T, Q_c)
+        U, S, Vt = np.linalg.svd(H)
+        R = np.dot(Vt.T, U.T)
+        if np.linalg.det(R) < 0:
+            Vt[2, :] *= -1
+            R = np.dot(Vt.T, U.T)
+        t = centroid_Q - np.dot(centroid_P, R.T)
+
+        for i in range(mol_copy.GetNumAtoms()):
+            p_orig = np.array(conf.GetAtomPosition(i))
+            p_new = np.dot(p_orig, R.T) + t
+            conf.SetAtomPosition(i, (float(p_new[0]), float(p_new[1]), float(p_new[2])))
+
+    return mol_copy
