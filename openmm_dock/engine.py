@@ -49,6 +49,8 @@ from .solvent import load_solvent_waters, create_solvent_tether_force
 from .covalent import (
     CovalentRestraint,
     create_covalent_restraint,
+    create_covalent_bond_force,
+    prealign_ligand_for_covalent_docking,
     detect_ligand_warhead,
 )
 
@@ -262,6 +264,92 @@ class DockingEngine:
                 except Exception:
                     continue
 
+    def _prepare_covalent(
+        self, ligand_mol: Chem.Mol, prealign_threshold_nm: float = 0.5
+    ) -> Tuple[Chem.Mol, Optional[CovalentRestraint]]:
+        """
+        Resolves self.covalent_res into a CovalentRestraint (if set). Only
+        rigidly pre-aligns the ligand (covalent.prealign_ligand_for_covalent_docking)
+        when the input pose's electrophile atom is *not already* near the
+        target attack geometry (beyond `prealign_threshold_nm`). Forcing the
+        heuristic two-point alignment onto a pose that's already close --
+        e.g. a co-crystal structure, or an already-docked/refined pose --
+        would throw away a perfectly good (often better than the heuristic's)
+        starting orientation. Called at the top of every public docking
+        method so every search protocol, not just minimize(), gets a
+        chemically sensible starting pose when it actually needs one.
+        """
+        if self.covalent_res is None:
+            return ligand_mol, None
+        restraint = create_covalent_restraint(self.receptor, ligand_mol, self.covalent_res)
+
+        conf = ligand_mol.GetConformer()
+        el_pos = np.array(conf.GetAtomPosition(restraint.lig_electrophile_idx))
+        nucl_pos = self.receptor.atoms[restraint.rec_nucleophile_idx].coord
+        current_dist_nm = float(np.linalg.norm(el_pos - nucl_pos)) * 0.1
+
+        if current_dist_nm <= prealign_threshold_nm:
+            return ligand_mol, restraint
+
+        aligned_mol = prealign_ligand_for_covalent_docking(ligand_mol, self.receptor, restraint)
+        aligned_mol = self._resolve_covalent_rotation(aligned_mol, restraint)
+        return aligned_mol, restraint
+
+    def _resolve_covalent_rotation(
+        self, ligand_mol: Chem.Mol, restraint: CovalentRestraint, n_candidates: int = 24
+    ) -> Chem.Mol:
+        """
+        prealign_ligand_for_covalent_docking fixes 5 of the ligand's 6 rigid-body
+        DOFs (electrophile position + 2 rotational, via the two-point
+        alignment); rotation about the forming bond axis itself is left
+        arbitrary. That single remaining DOF is exactly what determines
+        whether the rest of the ligand swings into open space or straight
+        into the receptor -- and it's cheap to resolve directly (1-D grid
+        search over a crude steric clash score against nearby receptor atoms)
+        rather than hoping a generic search protocol's small step sizes
+        stumble onto a clash-free angle. AutoDock's GA instead treats this as
+        just another torsion-tree DOF explored by the full population search;
+        since ours are local-refinement (see dock_genetic_algorithm), we
+        resolve it once, up front, the same way a real user would pick a
+        starting rotamer.
+        """
+        conf = ligand_mol.GetConformer()
+        coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
+        el_pos = coords[restraint.lig_electrophile_idx]
+        nucl_pos = self.receptor.atoms[restraint.rec_nucleophile_idx].coord
+        axis = el_pos - nucl_pos
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-6:
+            return ligand_mol
+        axis = axis / axis_norm
+
+        rec_coords = self.receptor.coordinates
+        near_mask = np.linalg.norm(rec_coords - el_pos, axis=1) < 12.0
+        rec_near = rec_coords[near_mask]
+        if rec_near.shape[0] == 0:
+            return ligand_mol
+
+        best_angle_rad = 0.0
+        best_clash = float("inf")
+        for angle_deg in np.linspace(0.0, 360.0, n_candidates, endpoint=False):
+            angle_rad = math.radians(angle_deg)
+            rot = ScipyRotation.from_rotvec(angle_rad * axis)
+            trial = el_pos + rot.apply(coords - el_pos)
+            d = np.linalg.norm(trial[:, None, :] - rec_near[None, :, :], axis=2)
+            clash = float(np.sum(np.clip(3.0 - d, 0.0, None) ** 2))
+            if clash < best_clash:
+                best_clash = clash
+                best_angle_rad = angle_rad
+
+        rot = ScipyRotation.from_rotvec(best_angle_rad * axis)
+        new_coords = el_pos + rot.apply(coords - el_pos)
+        mol_copy = Chem.Mol(ligand_mol)
+        conf2 = mol_copy.GetConformer()
+        for i in range(mol_copy.GetNumAtoms()):
+            p = new_coords[i]
+            conf2.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
+        return mol_copy
+
     def _build_system(
         self,
         ligand_mol: Chem.Mol,
@@ -455,10 +543,8 @@ class DockingEngine:
             anchor_idx = covalent_restraint.rec_nucleophile_anchor_idx
             el_idx = lig_start + covalent_restraint.lig_electrophile_idx
 
-            cov_bond = mm.HarmonicBondForce()
-            cov_bond.addBond(nucl_idx, el_idx, covalent_restraint.r0_nm, covalent_restraint.k_bond)
+            cov_bond = create_covalent_bond_force(covalent_restraint, nucl_idx, el_idx)
             cov_bond.setForceGroup(GROUP_VALENCE)
-            cov_bond.setName("CovalentAdductBond")
             system.addForce(cov_bond)
 
             cov_angle = mm.HarmonicAngleForce()
@@ -719,7 +805,16 @@ class DockingEngine:
         tether_constraints: Optional[List[TetherConstraint]] = None,
     ) -> Dict[str, float]:
         """Scores a single ligand pose without moving coordinates."""
-        system, _, _, _ = self._build_system(ligand_mol, tether_constraints)
+        # Note: unlike the search methods below, score() must not reposition the
+        # input pose -- it only needs the covalent restraint *force* included
+        # (so covalent bond/angle strain is reflected in the score), resolved
+        # against the pose as given.
+        covalent_restraint = (
+            create_covalent_restraint(self.receptor, ligand_mol, self.covalent_res)
+            if self.covalent_res is not None
+            else None
+        )
+        system, _, _, _ = self._build_system(ligand_mol, tether_constraints, covalent_restraint)
         integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
             mm.Context(system, integrator, self.platform)
@@ -744,16 +839,7 @@ class DockingEngine:
         """Performs local L-BFGS gradient minimization of ligand pose in cavity."""
         ligand_mol = Chem.Mol(ligand_mol)
         if covalent_restraint is None and self.covalent_res is not None:
-            covalent_restraint = create_covalent_restraint(self.receptor, ligand_mol, self.covalent_res)
-
-        if covalent_restraint is not None:
-            conf = ligand_mol.GetConformer()
-            nucl_pos = self.receptor.atoms[covalent_restraint.rec_nucleophile_idx].coord
-            el_pos = np.array(conf.GetAtomPosition(covalent_restraint.lig_electrophile_idx))
-            shift = (nucl_pos + np.array([0.05, 0.05, 0.05])) - el_pos
-            for i in range(ligand_mol.GetNumAtoms()):
-                p = np.array(conf.GetAtomPosition(i)) + shift
-                conf.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
+            ligand_mol, covalent_restraint = self._prepare_covalent(ligand_mol)
 
         system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint)
         integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
@@ -804,12 +890,14 @@ class DockingEngine:
         if self.pharma_points and not tether_constraints:
             ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
 
-        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints)
+        ligand_mol, covalent_restraint = self._prepare_covalent(ligand_mol)
+
+        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint)
         results: List[DockingResult] = []
 
         for run in range(n_runs):
             mol_rand = copy.deepcopy(ligand_mol)
-            if self.pharma_points or tether_constraints:
+            if self.pharma_points or tether_constraints or covalent_restraint is not None:
                 # Pharmacophore-constrained or Tethered docking: sample around aligned pose with rotational/translational jitter
                 from scipy.spatial.transform import Rotation as ScipyRotation
                 angles = np.random.uniform(-15.0, 15.0, size=3)
@@ -909,6 +997,8 @@ class DockingEngine:
         if self.pharma_points and not tether_constraints:
             ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
 
+        ligand_mol, covalent_restraint = self._prepare_covalent(ligand_mol)
+
         # 1. Identify rotatable single bonds and their moving subtrees
         rot_bonds = []
         for b in ligand_mol.GetBonds():
@@ -928,7 +1018,7 @@ class DockingEngine:
                                     q.append(nbr.GetIdx())
                     rot_bonds.append((a1, a2, list(st)))
 
-        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints)
+        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint)
         integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
             mm.Context(system, integrator, self.platform)
@@ -1101,6 +1191,8 @@ class DockingEngine:
         if self.pharma_points and not tether_constraints:
             ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
 
+        ligand_mol, covalent_restraint = self._prepare_covalent(ligand_mol)
+
         torsion_dofs = identify_torsion_dofs(ligand_mol)
         n_t = len(torsion_dofs)
 
@@ -1121,7 +1213,7 @@ class DockingEngine:
         # Two systems: a cheap single-force system for the O(pop x gens x runs) inner
         # search loop, and the real decomposed-score system used only once per run
         # (for the winning individual) so reported SCORE.INTER.* fields stay genuine.
-        search_system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, fast_search=True)
+        search_system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint, fast_search=True)
         search_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
             mm.Context(search_system, search_integrator, self.platform)
@@ -1129,7 +1221,7 @@ class DockingEngine:
             else mm.Context(search_system, search_integrator)
         )
 
-        report_system, _, _, _ = self._build_system(ligand_mol, tether_constraints, fast_search=False)
+        report_system, _, _, _ = self._build_system(ligand_mol, tether_constraints, covalent_restraint, fast_search=False)
         report_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         report_context = (
             mm.Context(report_system, report_integrator, self.platform)

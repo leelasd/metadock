@@ -38,6 +38,7 @@ def main():
     score_p.add_argument("-r", "--prm", required=True, help="Path to cavity.prm parameter file")
     score_p.add_argument("-i", "--input", required=True, help="Input SDF / SD ligand file")
     score_p.add_argument("-o", "--output", required=True, help="Output SDF file with scores")
+    score_p.add_argument("--covalent-res", default=None, help="Target reactive amino acid residue for covalent docking (e.g. CYS145, CYS797, SER195)")
     score_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: minimize
@@ -208,7 +209,7 @@ def main():
     writer = Chem.SDWriter(str(out_path))
 
     if args.command == "score":
-        engine = DockingEngine(receptor_path=rec_path, cavity=cavity)
+        engine = DockingEngine(receptor_path=rec_path, cavity=cavity, covalent_res=getattr(args, "covalent_res", None))
         for i, lig in enumerate(ligands):
             scores = engine.score(lig)
             for k, v in scores.items():

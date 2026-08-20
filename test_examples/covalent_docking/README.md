@@ -2,6 +2,8 @@
 
 This folder contains a complete demonstration of **GPU-accelerated covalent docking** in `openmm-dock`, targeting a reactive nucleophilic residue in a macromolecular cavity.
 
+> **Known limitation:** CYS33 in this receptor was picked for demo purposes and has not been verified to be solvent-accessible -- geometric probing shows another receptor atom within ~1.5 Å of the ideal attack point, i.e. this residue may simply be buried. Expect a poor (positive/clashing) score here regardless of search settings. For a validated, experimentally real covalent site, see [`6di9/`](6di9/) (BTK Cys481 + the clinical covalent inhibitor GJJ).
+
 ---
 
 ## 1. System Components
