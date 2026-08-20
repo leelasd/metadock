@@ -249,3 +249,163 @@ class KinematicDockingEngine:
                 frame_count += 1
                 
         return frames
+
+
+@dataclass
+class SwarmParticle:
+    """Represents an articulated kinematic particle in the PSO swarm."""
+    particle_id: int
+    trans: np.ndarray            # (3,) Translation in Å
+    rot_vec: np.ndarray          # (3,) Rodrigues rotation vector
+    dihedrals: np.ndarray        # (k,) Joint dihedrals in radians
+    v_trans: np.ndarray          # (3,) Translation velocity
+    v_rot: np.ndarray            # (3,) Rotational velocity
+    v_dihedrals: np.ndarray      # (k,) Joint angular velocities
+    p_best_trans: np.ndarray
+    p_best_rot: np.ndarray
+    p_best_dihedrals: np.ndarray
+    p_best_score: float
+    current_score: float
+
+
+class KinematicParticleSwarmOptimizer:
+    """
+    Particle Swarm Optimization on the (SE(3) x T^k) Kinematic Manifold.
+    Coordinates multi-particle swarms to escape local surface traps into deep catalytic clefts.
+    """
+    def __init__(self, kin_engine: KinematicDockingEngine):
+        self.kin_engine = kin_engine
+        self.tree = kin_engine.tree
+        self.num_torsions = self.tree.num_torsions
+
+    @staticmethod
+    def _toroidal_sub(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Calculates the shortest angular difference on the circle T^k."""
+        return np.arctan2(np.sin(a - b), np.cos(a - b))
+
+    def run_pso(
+        self,
+        n_particles: int = 20,
+        n_iterations: int = 25,
+        w: float = 0.729,
+        c1: float = 1.494,
+        c2: float = 1.494,
+        ref_mol: Optional[Chem.Mol] = None
+    ) -> Tuple[Chem.Mol, float, List[Chem.Mol]]:
+        """
+        Executes Kinematic PSO and returns (best_mol, best_score, swarm_movie_frames).
+        """
+        particles: List[SwarmParticle] = []
+        g_best_trans = np.zeros(3)
+        g_best_rot = np.zeros(3)
+        g_best_dihedrals = np.zeros(self.num_torsions)
+        g_best_score = 9999999.0
+        
+        # 1. Initialize Swarm Particles with diverse random kinematic configurations
+        for p_id in range(n_particles):
+            if p_id == 0:
+                t_init = np.zeros(3)
+                r_init = np.zeros(3)
+                d_init = np.zeros(self.num_torsions)
+            else:
+                t_init = np.random.uniform(-4.0, 4.0, 3)
+                r_init = np.random.uniform(-np.pi, np.pi, 3)
+                d_init = np.random.uniform(-np.pi, np.pi, self.num_torsions)
+                
+            q_init = ScipyRotation.from_rotvec(r_init).as_quat()
+            score, _ = self.kin_engine.evaluate_state(t_init, q_init, d_init)
+            
+            p = SwarmParticle(
+                particle_id=p_id,
+                trans=t_init.copy(),
+                rot_vec=r_init.copy(),
+                dihedrals=d_init.copy(),
+                v_trans=np.random.uniform(-1.0, 1.0, 3),
+                v_rot=np.random.uniform(-0.5, 0.5, 3),
+                v_dihedrals=np.random.uniform(-0.5, 0.5, self.num_torsions),
+                p_best_trans=t_init.copy(),
+                p_best_rot=r_init.copy(),
+                p_best_dihedrals=d_init.copy(),
+                p_best_score=score,
+                current_score=score
+            )
+            particles.append(p)
+            
+            if score < g_best_score:
+                g_best_score = score
+                g_best_trans = t_init.copy()
+                g_best_rot = r_init.copy()
+                g_best_dihedrals = d_init.copy()
+
+        # Movie frames across iterations
+        movie_frames: List[Chem.Mol] = []
+        heavy_indices = [a.GetIdx() for a in self.tree.mol.GetAtoms() if a.GetAtomicNum() > 1]
+        p_ref = None
+        if ref_mol is not None:
+            p_ref = np.array([ref_mol.GetConformer().GetAtomPosition(i) for i in heavy_indices])
+            
+        # 2. Main Swarm Evolution Loop
+        for it in range(n_iterations):
+            for p in particles:
+                r1 = np.random.uniform(0.0, 1.0)
+                r2 = np.random.uniform(0.0, 1.0)
+                
+                # Velocity updates
+                # A. Translation velocity
+                p.v_trans = (
+                    w * p.v_trans
+                    + c1 * r1 * (p.p_best_trans - p.trans)
+                    + c2 * r2 * (g_best_trans - p.trans)
+                )
+                p.trans += np.clip(p.v_trans, -3.0, 3.0)
+                
+                # B. Rotational velocity
+                diff_rot_p = self._toroidal_sub(p.p_best_rot, p.rot_vec)
+                diff_rot_g = self._toroidal_sub(g_best_rot, p.rot_vec)
+                p.v_rot = w * p.v_rot + c1 * r1 * diff_rot_p + c2 * r2 * diff_rot_g
+                p.rot_vec = (p.rot_vec + np.clip(p.v_rot, -1.0, 1.0) + np.pi) % (2 * np.pi) - np.pi
+                
+                # C. Dihedral velocity on T^k
+                diff_d_p = self._toroidal_sub(p.p_best_dihedrals, p.dihedrals)
+                diff_d_g = self._toroidal_sub(g_best_dihedrals, p.dihedrals)
+                p.v_dihedrals = w * p.v_dihedrals + c1 * r1 * diff_d_p + c2 * r2 * diff_d_g
+                p.dihedrals = (p.dihedrals + np.clip(p.v_dihedrals, -1.0, 1.0) + np.pi) % (2 * np.pi) - np.pi
+                
+                # Evaluate new energy
+                q_curr = ScipyRotation.from_rotvec(p.rot_vec).as_quat()
+                score, coords = self.kin_engine.evaluate_state(p.trans, q_curr, p.dihedrals)
+                p.current_score = score
+                
+                # Update Personal Best
+                if score < p.p_best_score:
+                    p.p_best_score = score
+                    p.p_best_trans = p.trans.copy()
+                    p.p_best_rot = p.rot_vec.copy()
+                    p.p_best_dihedrals = p.dihedrals.copy()
+                    
+                # Update Global Swarm Best
+                if score < g_best_score:
+                    g_best_score = score
+                    g_best_trans = p.trans.copy()
+                    g_best_rot = p.rot_vec.copy()
+                    g_best_dihedrals = p.dihedrals.copy()
+                    
+                # Record frame for PyMOL movie
+                mol_f = self.tree.coords_to_mol(coords)
+                mol_f.SetProp("ITERATION", str(it + 1))
+                mol_f.SetProp("PARTICLE_ID", str(p.particle_id + 1))
+                mol_f.SetProp("SCORE_KCAL", f"{score:.2f}")
+                mol_f.SetProp("SWARM_BEST_SCORE", f"{g_best_score:.2f}")
+                mol_f.SetProp("MAX_BOND_DEV_A", "0.0000")
+                if p_ref is not None:
+                    p_curr = coords[heavy_indices]
+                    rmsd = float(np.sqrt(np.mean(np.sum((p_curr - p_ref)**2, axis=1))))
+                    mol_f.SetProp("RMSD_TO_CRYSTAL_A", f"{rmsd:.2f}")
+                movie_frames.append(mol_f)
+
+        # Build final best molecule
+        q_best = ScipyRotation.from_rotvec(g_best_rot).as_quat()
+        _, best_coords = self.kin_engine.evaluate_state(g_best_trans, q_best, g_best_dihedrals)
+        best_mol = self.tree.coords_to_mol(best_coords)
+        best_mol.SetProp("DOCK_SCORE", f"{g_best_score:.3f}")
+        return best_mol, g_best_score, movie_frames
