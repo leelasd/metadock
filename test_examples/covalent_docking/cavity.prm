@@ -1,0 +1,17 @@
+RBT_PARAMETER_FILE_V1.00
+TITLE CDK2_Covalent_CYS33
+
+RECEPTOR_FILE receptor.mol2
+RECEPTOR_FLEX 3.0
+
+##################################################################
+### CAVITY DEFINITION: REFERENCE LIGAND METHOD
+##################################################################
+SECTION CAVITY
+    SCORING_FUNCTION    RbtCavityGridSF
+    WEIGHT              1.0
+    CENTER              (-12.52, 2.40, 25.58)
+    RADIUS              14.0
+    GRID                0.5
+    QUAD_ALL            TRUE
+END_SECTION
