@@ -7,6 +7,7 @@ import sys
 import re
 from typing import Tuple, List, Optional
 from pathlib import Path
+import numpy as np
 from rdkit import Chem
 
 from .core import SDFParser, Mol2Parser
@@ -67,10 +68,72 @@ def main():
     mc_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
     mc_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
 
+    # Command: stats
+    stats_p = subparsers.add_parser("stats", help="Compute docking statistics (heavy-atom RMSD, valence bond & angle deviations) vs crystal reference")
+    stats_p.add_argument("-ref", "--reference", required=True, help="Reference co-crystal ligand SDF / SD file")
+    stats_p.add_argument("-i", "--input", required=True, help="Docked poses SDF / SD file to evaluate")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    if args.command == "stats":
+        ref_path = Path(args.reference)
+        in_path = Path(args.input)
+        ref_mols = SDFParser.load_molecules(ref_path)
+        if not ref_mols:
+            sys.exit(f"Error: could not load reference ligand {ref_path}")
+        ref_mol = ref_mols[0]
+        test_mols = SDFParser.load_molecules(in_path)
+        if not test_mols:
+            sys.exit(f"Error: could not load test poses from {in_path}")
+
+        conf_r = ref_mol.GetConformer()
+        heavy_r = [a.GetIdx() for a in ref_mol.GetAtoms() if a.GetAtomicNum() > 1]
+
+        print(f"[*] Comparing {len(test_mols)} docked pose(s) from {in_path} against crystal reference {ref_path}")
+        print(f"{'Pose':<8} | {'Score (kcal/mol)':<18} | {'Heavy RMSD (Å)':<16} | {'Max Bond Dev (Å)':<18} | {'Max Angle Dev (°)':<18} | {'Status'}")
+        print("-" * 105)
+
+        from rdkit.Chem import rdMolTransforms
+        for idx, t_mol in enumerate(test_mols):
+            conf_t = t_mol.GetConformer()
+            heavy_t = [a.GetIdx() for a in t_mol.GetAtoms() if a.GetAtomicNum() > 1]
+            score_str = t_mol.GetProp("SCORE") if t_mol.HasProp("SCORE") else "N/A"
+
+            if len(heavy_r) == len(heavy_t):
+                p_r = np.array([conf_r.GetAtomPosition(i) for i in heavy_r])
+                p_t = np.array([conf_t.GetAtomPosition(i) for i in heavy_t])
+                rmsd = float(np.sqrt(np.mean(np.sum((p_t - p_r) ** 2, axis=1))))
+                rmsd_str = f"{rmsd:.3f}"
+                status = "SUCCESS (RMSD < 2.0 Å)" if rmsd < 2.0 else "POOR"
+            else:
+                rmsd_str = "N/A"
+                status = "Scaffold Mismatch"
+
+            bond_diffs = []
+            for b in t_mol.GetBonds():
+                a1, a2 = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+                d_r = np.linalg.norm(np.array(conf_r.GetAtomPosition(a1)) - np.array(conf_r.GetAtomPosition(a2)))
+                d_t = np.linalg.norm(np.array(conf_t.GetAtomPosition(a1)) - np.array(conf_t.GetAtomPosition(a2)))
+                bond_diffs.append(abs(d_t - d_r))
+            max_b = max(bond_diffs) if bond_diffs else 0.0
+
+            angle_diffs = []
+            for atom in t_mol.GetAtoms():
+                c = atom.GetIdx()
+                nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
+                for i in range(len(nbrs)):
+                    for j in range(i + 1, len(nbrs)):
+                        a1, a3 = nbrs[i], nbrs[j]
+                        th_r = rdMolTransforms.GetAngleDeg(conf_r, a1, c, a3)
+                        th_t = rdMolTransforms.GetAngleDeg(conf_t, a1, c, a3)
+                        angle_diffs.append(abs(th_t - th_r))
+            max_a = max(angle_diffs) if angle_diffs else 0.0
+
+            print(f"#{idx+1:<7} | {score_str:<18} | {rmsd_str:<16} | {max_b:<18.4f} | {max_a:<18.2f} | {status}")
+        return
 
     prm_path = Path(args.prm)
     rec_path, cavity = parse_prm_receptor_and_cavity(prm_path)
