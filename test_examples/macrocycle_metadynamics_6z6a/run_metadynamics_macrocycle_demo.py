@@ -1,7 +1,7 @@
 """
 Demonstration of Kinematic Metadynamics (Kin-MetaD) on PDB 6Z6A (Keap1 + Q9E Macrocycle).
 Deposits history-dependent repulsive Gaussian hills to fill local energy traps and
-force exhaustive conformational exploration on the kinematic manifold.
+force smooth, continuous physical dynamics across the kinematic manifold.
 """
 from pathlib import Path
 import numpy as np
@@ -33,28 +33,20 @@ unified_engine = UnifiedKinematicPSOEngine(
 metad_engine = KinematicMetadynamicsEngine(
     unified_engine,
     gaussian_height_w=25.0,  # +25 kcal/mol per Gaussian hill
-    gaussian_sigma=0.45      # ~0.45 rad / 0.9 Å width
+    gaussian_sigma=0.50      # Smooth Gaussian width
 )
 
-# 3. Run Kinematic Metadynamics Exploration (50 Steps)
-print("\n[*] Launching Kinematic Metadynamics (Kin-MetaD)...")
+# 3. Run Smooth Kinematic Metadynamics Exploration (100 Steps)
+print("\n[*] Launching Smooth Kinematic Metadynamics (Kin-MetaD, 100 Frames)...")
 best_lig, best_rec_coords, best_score, lig_frames, rec_frames, logs = metad_engine.run_metadynamics_exploration(
-    n_steps=50,
-    deposit_frequency=3,
-    temperature_k=300.0
+    n_steps=100,
+    deposit_frequency=5,
+    step_size=0.04
 )
 
 print(f"\n[✓] Kin-MetaD Exploration Completed!")
 print(f"    • Total Gaussian Hills Deposited: {len(metad_engine.visited_basins)} hills")
 print(f"    • Global Best Physical Score     : {best_score:.3f} kcal/mol")
-
-# Print Summary Log Table
-print("\n" + "=" * 80)
-print(f"{'Step':<6} | {'Raw Score (kcal)':<18} | {'Bias Energy (kcal)':<20} | {'Effective Score':<16} | {'Hills':<6}")
-print("-" * 80)
-for row in logs[::5]:
-    print(f"{row['step']:<6d} | {row['raw_score']:<18.2f} | {row['bias_kcal']:<20.2f} | {row['effective_score']:<16.2f} | {row['num_hills']:<6d}")
-print("=" * 80)
 
 # 4. Save Multi-Track PyMOL Movie
 out_lig_movie = DEMO_DIR / "metadynamics_macrocycle_trajectory.sdf"
@@ -81,10 +73,9 @@ w_best.write(best_lig)
 w_best.close()
 unified_engine.rec_kin.write_pdb_frame(best_rec_coords, DEMO_DIR / "metadynamics_best_receptor.pdb")
 
-print(f"\n[✓] Saved Synchronized 50-Frame Metadynamics Trajectory:")
+print(f"\n[✓] Saved Synchronized 100-Frame Metadynamics Trajectory:")
 print(f"    • Macrocycle Movie: {out_lig_movie.name}")
 print(f"    • Receptor Movie  : {out_rec_movie.name}")
-print(f"    • Best Complex    : metadynamics_best_pose.sdf + metadynamics_best_receptor.pdb")
 
 # 5. Generate PyMOL Script
 flex_res_str = " or ".join(f"(resi {r.res_num} and resn {r.res_name})" for r in unified_engine.rec_kin.flex_residues)
@@ -137,14 +128,14 @@ color yellow, sb_arg483
 set dash_width, 3.0
 
 zoom q9e_metad_macrocycle, 6.5
-set movie_fps, 20
+set movie_fps, 24
 mplay
 
 print "================================================================="
-print "  Loaded 50-Frame KINEMATIC METADYNAMICS (Kin-MetaD) MOVIE!"
+print "  Loaded 100-Frame KINEMATIC METADYNAMICS (Kin-MetaD) MOVIE!"
 print "  • Repulsive Gaussian Hills fill visited decoy traps (+25 kcal/mol)"
-print "  • Forces the 16-membered macrocycle to explore all pocket sub-states"
-print "  • Press Play (bottom right) or Spacebar to watch trap-escaping movie!"
+print "  • Watch the 16-membered macrocycle continuously glide & escape traps!"
+print "  • Press Play (bottom right) or Spacebar to watch active 3D dynamics!"
 print "================================================================="
 """
 (DEMO_DIR / "visualize_metadynamics_pymol.pml").write_text(pml_content)

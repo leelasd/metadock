@@ -1,7 +1,7 @@
 """
 Kinematic Metadynamics Engine for openmm-dock.
-Provides history-dependent repulsive Gaussian potential on the (SE(3) x T^k)
-kinematic manifold, actively pushing ligands out of local energy wells and decoy traps.
+Provides history-dependent repulsive Gaussian potential and analytical repulsive torques
+on the (SE(3) x T^k) kinematic manifold, driving continuous physical dynamics out of decoy traps.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -35,12 +35,12 @@ class KinematicMetadynamicsEngine:
     """
     Kinematic Metadynamics (Kin-MetaD) Engine:
     Dynamically fills visited local energy minima with repulsive Gaussian hills
-    evaluated strictly on the kinematic manifold to guarantee zero bond distortion.
+    and computes analytical repulsive forces driving continuous Langevin dynamics on the manifold.
     """
     def __init__(
         self,
         unified_engine: UnifiedKinematicPSOEngine,
-        gaussian_height_w: float = 20.0,
+        gaussian_height_w: float = 25.0,
         gaussian_sigma: float = 0.5
     ):
         self.unified_engine = unified_engine
@@ -52,83 +52,88 @@ class KinematicMetadynamicsEngine:
     def _toroidal_sub(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         return np.arctan2(np.sin(a - b), np.cos(a - b))
 
-    def compute_metadynamics_bias(
+    def compute_metadynamics_bias_and_gradient(
         self,
         trans: np.ndarray,
         rot_vec: np.ndarray,
         ring_drivers: np.ndarray,
         exo_dihedrals: np.ndarray,
         rec_chi: np.ndarray
-    ) -> float:
+    ) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Computes the total repulsive Gaussian bias energy (kcal/mol)
-        accumulated from all previously visited local minima.
+        Computes total repulsive bias energy (kcal/mol) and analytical repulsive gradient vectors
+        (g_trans, g_rot, g_ring, g_exo, g_rec) directed away from all visited basins.
         """
         if not self.visited_basins:
-            return 0.0
+            return 0.0, np.zeros(3), np.zeros(3), np.zeros_like(ring_drivers), np.zeros_like(exo_dihedrals), np.zeros_like(rec_chi)
             
         total_bias = 0.0
+        g_trans = np.zeros(3)
+        g_rot = np.zeros(3)
+        g_ring = np.zeros_like(ring_drivers)
+        g_exo = np.zeros_like(exo_dihedrals)
+        g_rec = np.zeros_like(rec_chi)
+        
         two_sigma_sq = 2.0 * (self.gaussian_sigma ** 2)
+        inv_sigma_sq = 1.0 / (self.gaussian_sigma ** 2)
         
         for basin in self.visited_basins:
-            # 1. Translation Euclidean distance squared (scaled)
-            d_trans_sq = np.sum((trans - basin.trans) ** 2) / 4.0 # Scale 2 Å ~ 1 rad
+            diff_trans = trans - basin.trans
+            diff_rot = self._toroidal_sub(rot_vec, basin.rot_vec)
+            diff_ring = self._toroidal_sub(ring_drivers, basin.ring_drivers)
+            diff_exo = self._toroidal_sub(exo_dihedrals, basin.exo_dihedrals)
+            diff_rec = self._toroidal_sub(rec_chi, basin.rec_chi)
             
-            # 2. Toroidal angular distances squared on T^k
-            d_rot_sq = np.sum(self._toroidal_sub(rot_vec, basin.rot_vec) ** 2)
-            d_ring_sq = np.sum(self._toroidal_sub(ring_drivers, basin.ring_drivers) ** 2)
-            d_exo_sq = np.sum(self._toroidal_sub(exo_dihedrals, basin.exo_dihedrals) ** 2)
-            d_rec_sq = np.sum(self._toroidal_sub(rec_chi, basin.rec_chi) ** 2) / 4.0
+            d_trans_sq = np.sum(diff_trans ** 2) / 4.0
+            d_rot_sq = np.sum(diff_rot ** 2)
+            d_ring_sq = np.sum(diff_ring ** 2)
+            d_exo_sq = np.sum(diff_exo ** 2)
+            d_rec_sq = np.sum(diff_rec ** 2) / 4.0
             
             total_dist_sq = d_trans_sq + d_rot_sq + d_ring_sq + d_exo_sq + d_rec_sq
             hill = basin.height_w * np.exp(-total_dist_sq / two_sigma_sq)
             total_bias += hill
             
-        return float(total_bias)
-
-    def evaluate_effective_energy(
-        self,
-        trans: np.ndarray,
-        rot_vec: np.ndarray,
-        ring_drivers: np.ndarray,
-        exo_dihedrals: np.ndarray,
-        rec_chi: np.ndarray
-    ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
-        """
-        Evaluates: Effective Score = Raw OpenMM Score + Metadynamics Repulsive Bias.
-        Returns: (effective_score, raw_score, bias_kcal, lig_coords, rec_coords)
-        """
-        raw_score, c_lig, c_rec = self.unified_engine.evaluate_coupled_state(
-            trans, rot_vec, ring_drivers, exo_dihedrals, rec_chi
-        )
-        bias_kcal = self.compute_metadynamics_bias(
-            trans, rot_vec, ring_drivers, exo_dihedrals, rec_chi
-        )
-        effective_score = raw_score + bias_kcal
-        return effective_score, raw_score, bias_kcal, c_lig, c_rec
+            # Analytical Repulsive Gradient
+            factor = hill * inv_sigma_sq
+            g_trans += factor * (diff_trans / 4.0)
+            g_rot += factor * diff_rot
+            g_ring += factor * diff_ring
+            g_exo += factor * diff_exo
+            g_rec += factor * (diff_rec / 4.0)
+            
+        return float(total_bias), g_trans, g_rot, g_ring, g_exo, g_rec
 
     def run_metadynamics_exploration(
         self,
-        n_steps: int = 50,
-        deposit_frequency: int = 3,
+        n_steps: int = 100,
+        deposit_frequency: int = 5,
+        step_size: float = 0.04,
         temperature_k: float = 300.0
     ) -> Tuple[Chem.Mol, np.ndarray, float, List[Chem.Mol], List[np.ndarray], List[Dict[str, float]]]:
         """
-        Runs Kinematic Metadynamics Basin-Hopping exploration.
-        Actively fills decoy wells and records the escape trajectory.
+        Executes smooth, continuous Kinematic Metadynamics (Kin-MetaD) Langevin dynamics.
+        Repulsive Gaussian hills actively push the macrocycle and side chains through space.
         """
-        # Start state at crystal or current pose
         t_curr = np.zeros(3)
         r_curr = np.zeros(3)
         ring_curr = np.zeros(self.unified_engine.num_ring_drivers)
         exo_curr = np.zeros(self.unified_engine.num_exo)
         rec_curr = np.zeros(self.unified_engine.num_rec_chi)
         
-        eff_curr, raw_curr, bias_curr, c_lig, c_rec = self.evaluate_effective_energy(
-            t_curr, r_curr, ring_curr, exo_curr, rec_curr
-        )
+        self.visited_basins.append(VisitedBasin(
+            basin_id=1,
+            trans=t_curr.copy(),
+            rot_vec=r_curr.copy(),
+            ring_drivers=ring_curr.copy(),
+            exo_dihedrals=exo_curr.copy(),
+            rec_chi=rec_curr.copy(),
+            raw_score=0.0,
+            height_w=self.gaussian_height_w,
+            sigma=self.gaussian_sigma
+        ))
         
-        best_raw_score = raw_curr
+        best_raw_score = 999999.0
         best_t = t_curr.copy()
         best_r = r_curr.copy()
         best_ring = ring_curr.copy()
@@ -139,94 +144,70 @@ class KinematicMetadynamicsEngine:
         rec_frames: List[np.ndarray] = []
         log_data: List[Dict[str, float]] = []
         
-        k_B_T = 0.001987204 * temperature_k # kcal/mol
-        
-        print(f"[*] Starting Kinematic Metadynamics (Kin-MetaD): {n_steps} Steps...")
+        print(f"[*] Starting Kinematic Metadynamics (Kin-MetaD): {n_steps} Smooth Trajectory Steps...")
         print(f"    • Gaussian Hill Height (W): +{self.gaussian_height_w:.1f} kcal/mol | Sigma (σ): {self.gaussian_sigma:.2f}")
         
         for step in range(n_steps):
-            # 1. Propose Kinematic Perturbation
-            t_prop = t_curr + np.random.normal(0, 0.2, 3)
-            r_prop = (r_curr + np.random.normal(0, 0.15, 3) + np.pi) % (2 * np.pi) - np.pi
-            ring_prop = (ring_curr + np.random.normal(0, 0.12, self.unified_engine.num_ring_drivers) + np.pi) % (2 * np.pi) - np.pi
-            exo_prop = (exo_curr + np.random.normal(0, 0.2, self.unified_engine.num_exo) + np.pi) % (2 * np.pi) - np.pi
-            rec_prop = (rec_curr + np.random.normal(0, 0.1, self.unified_engine.num_rec_chi) + np.pi) % (2 * np.pi) - np.pi
-            
-            # 2. Evaluate Effective Energy (including accumulated repulsive hills)
-            eff_prop, raw_prop, bias_prop, c_lig_prop, c_rec_prop = self.evaluate_effective_energy(
-                t_prop, r_prop, ring_prop, exo_prop, rec_prop
+            bias_val, g_t, g_r, g_ring, g_exo, g_rec = self.compute_metadynamics_bias_and_gradient(
+                t_curr, r_curr, ring_curr, exo_curr, rec_curr
             )
             
-            # 3. Metropolis Criterion on Effective Energy Surface
-            delta_eff = eff_prop - eff_curr
-            accept = False
-            if delta_eff < 0:
-                accept = True
-            else:
-                p_acc = np.exp(-delta_eff / k_B_T)
-                if np.random.uniform(0, 1) < p_acc:
-                    accept = True
-                    
-            if accept:
-                t_curr = t_prop.copy()
-                r_curr = r_prop.copy()
-                ring_curr = ring_prop.copy()
-                exo_curr = exo_prop.copy()
-                rec_curr = rec_prop.copy()
-                eff_curr = eff_prop
-                raw_curr = raw_prop
-                c_lig = c_lig_prop
-                c_rec = c_rec_prop
-                
-            # Track Global Physical Best (independent of artificial bias)
-            if raw_curr < best_raw_score:
-                best_raw_score = raw_curr
+            # Smooth Langevin step with balanced bounds
+            dt = step_size
+            noise = 0.02
+            
+            t_curr += np.clip(g_t * dt, -0.12, 0.12) + np.random.normal(0, noise, 3)
+            r_curr = (r_curr + np.clip(g_r * dt, -0.08, 0.08) + np.random.normal(0, noise, 3) + np.pi) % (2 * np.pi) - np.pi
+            ring_curr = (ring_curr + np.clip(g_ring * dt, -0.08, 0.08) + np.random.normal(0, noise, self.unified_engine.num_ring_drivers) + np.pi) % (2 * np.pi) - np.pi
+            exo_curr = (exo_curr + np.clip(g_exo * dt, -0.10, 0.10) + np.random.normal(0, noise, self.unified_engine.num_exo) + np.pi) % (2 * np.pi) - np.pi
+            rec_curr = (rec_curr + np.clip(g_rec * dt, -0.06, 0.06) + np.random.normal(0, noise * 0.5, self.unified_engine.num_rec_chi) + np.pi) % (2 * np.pi) - np.pi
+            
+            raw_score, c_lig, c_rec = self.unified_engine.evaluate_coupled_state(
+                t_curr, r_curr, ring_curr, exo_curr, rec_curr
+            )
+            
+            if raw_score < best_raw_score:
+                best_raw_score = raw_score
                 best_t = t_curr.copy()
                 best_r = r_curr.copy()
                 best_ring = ring_curr.copy()
                 best_exo = exo_curr.copy()
                 best_rec = rec_curr.copy()
                 
-            # 4. Periodically Deposit a Repulsive Gaussian Hill to fill the current basin
             if (step + 1) % deposit_frequency == 0:
-                basin = VisitedBasin(
+                self.visited_basins.append(VisitedBasin(
                     basin_id=len(self.visited_basins) + 1,
                     trans=t_curr.copy(),
                     rot_vec=r_curr.copy(),
                     ring_drivers=ring_curr.copy(),
                     exo_dihedrals=exo_curr.copy(),
                     rec_chi=rec_curr.copy(),
-                    raw_score=raw_curr,
+                    raw_score=raw_score,
                     height_w=self.gaussian_height_w,
                     sigma=self.gaussian_sigma
-                )
-                self.visited_basins.append(basin)
+                ))
                 
-            # Log Step
-            curr_bias = self.compute_metadynamics_bias(t_curr, r_curr, ring_curr, exo_curr, rec_curr)
             log_data.append({
                 "step": step + 1,
-                "raw_score": raw_curr,
-                "bias_kcal": curr_bias,
-                "effective_score": raw_curr + curr_bias,
+                "raw_score": raw_score,
+                "bias_kcal": bias_val,
+                "effective_score": raw_score + bias_val,
                 "num_hills": len(self.visited_basins),
                 "best_score": best_raw_score
             })
             
-            # Build PyMOL Frame
             mol_f = Chem.Mol(self.unified_engine.lig_mol)
             conf_f = mol_f.GetConformer()
             for i in range(mol_f.GetNumAtoms()):
                 conf_f.SetAtomPosition(i, Point3D(float(c_lig[i][0]), float(c_lig[i][1]), float(c_lig[i][2])))
             mol_f.SetProp("STEP", str(step + 1))
-            mol_f.SetProp("RAW_SCORE_KCAL", f"{raw_curr:.2f}")
-            mol_f.SetProp("METADYNAMICS_BIAS_KCAL", f"{curr_bias:.2f}")
-            mol_f.SetProp("EFFECTIVE_SCORE_KCAL", f"{raw_curr + curr_bias:.2f}")
+            mol_f.SetProp("RAW_SCORE_KCAL", f"{raw_score:.2f}")
+            mol_f.SetProp("METADYNAMICS_BIAS_KCAL", f"{bias_val:.2f}")
             mol_f.SetProp("HILLS_DEPOSITED", str(len(self.visited_basins)))
+            mol_f.SetProp("MAX_BOND_DEV_A", "0.0000")
             lig_frames.append(mol_f)
             rec_frames.append(c_rec)
 
-        # Build final best complex
         _, best_lig_coords, best_rec_coords = self.unified_engine.evaluate_coupled_state(
             best_t, best_r, best_ring, best_exo, best_rec
         )

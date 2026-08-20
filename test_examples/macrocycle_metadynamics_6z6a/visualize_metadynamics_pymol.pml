@@ -47,12 +47,12 @@ color yellow, sb_arg483
 set dash_width, 3.0
 
 zoom q9e_metad_macrocycle, 6.5
-set movie_fps, 20
+set movie_fps, 24
 mplay
 
 print "================================================================="
-print "  Loaded 50-Frame KINEMATIC METADYNAMICS (Kin-MetaD) MOVIE!"
+print "  Loaded 100-Frame KINEMATIC METADYNAMICS (Kin-MetaD) MOVIE!"
 print "  • Repulsive Gaussian Hills fill visited decoy traps (+25 kcal/mol)"
-print "  • Forces the 16-membered macrocycle to explore all pocket sub-states"
-print "  • Press Play (bottom right) or Spacebar to watch trap-escaping movie!"
+print "  • Watch the 16-membered macrocycle continuously glide & escape traps!"
+print "  • Press Play (bottom right) or Spacebar to watch active 3D dynamics!"
 print "================================================================="
