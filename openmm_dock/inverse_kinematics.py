@@ -250,3 +250,193 @@ class MacrocycleInverseKinematics:
             frames.append(mol_f)
             
         return frames
+
+
+@dataclass
+class ExocyclicJoint:
+    """Represents an unconstrained exocyclic side-chain rotatable bond."""
+    joint_idx: int
+    begin_atom_idx: int
+    end_atom_idx: int
+    moving_atom_indices: List[int]
+    name: str = ""
+
+
+class TwoTierMacrocycleEngine:
+    """
+    Decoupled Two-Tier Macrocycle Docking Engine:
+    • Tier 1: Endocyclic Ring Backbone (Constrained Manifold via Inverse Kinematics)
+    • Tier 2: Exocyclic Side-Chain Arms (Unconstrained Torus via Forward Kinematics)
+    """
+    def __init__(self, mol: Chem.Mol):
+        self.mol = Chem.Mol(mol)
+        self.ik_engine = MacrocycleInverseKinematics(mol)
+        self.num_atoms = mol.GetNumAtoms()
+        conf = self.mol.GetConformer()
+        self.base_coords = np.array(
+            [conf.GetAtomPosition(i) for i in range(self.num_atoms)], dtype=np.float64
+        )
+        self.ring_set = set(self.ik_engine.ring_atoms)
+        
+        # Identify exocyclic rotatable bonds
+        rot_smarts = Chem.MolFromSmarts("[!$(*#*)&!D1]-!@[!$(*#*)&!D1]")
+        matches = self.mol.GetSubstructMatches(rot_smarts)
+        
+        self.exo_joints: List[ExocyclicJoint] = []
+        seen = set()
+        for a1, a2 in matches:
+            pair = tuple(sorted([a1, a2]))
+            if pair in seen:
+                continue
+            seen.add(pair)
+            b = self.mol.GetBondBetweenAtoms(a1, a2)
+            if not b.IsInRing():
+                # If a1 is in the ring or closer to the ring, moving subtree is on a2 side
+                if a1 in self.ring_set and a2 not in self.ring_set:
+                    moving = self._find_exocyclic_subtree(a1, a2)
+                elif a2 in self.ring_set and a1 not in self.ring_set:
+                    a1, a2 = a2, a1
+                    moving = self._find_exocyclic_subtree(a1, a2)
+                else:
+                    moving = self._find_exocyclic_subtree(a1, a2)
+                    
+                sym1 = self.mol.GetAtomWithIdx(a1).GetSymbol()
+                sym2 = self.mol.GetAtomWithIdx(a2).GetSymbol()
+                self.exo_joints.append(ExocyclicJoint(
+                    joint_idx=len(self.exo_joints),
+                    begin_atom_idx=a1,
+                    end_atom_idx=a2,
+                    moving_atom_indices=moving,
+                    name=f"{sym1}{a1}-{sym2}{a2}"
+                ))
+                
+        print(f"[*] Two-Tier Macrocycle Engine Ready: {self.ik_engine.num_joints} Ring IK Joints | {len(self.exo_joints)} Exocyclic FK Joints")
+
+    def _find_exocyclic_subtree(self, begin_idx: int, split_idx: int) -> List[int]:
+        """Finds all atoms downstream on the exocyclic side without crossing begin_idx."""
+        visited: Set[int] = {split_idx}
+        queue = [split_idx]
+        while queue:
+            curr = queue.pop(0)
+            for nbr in self.mol.GetAtomWithIdx(curr).GetNeighbors():
+                n_idx = nbr.GetIdx()
+                if n_idx != begin_idx and n_idx not in visited:
+                    visited.add(n_idx)
+                    queue.append(n_idx)
+        return sorted(list(visited))
+
+    def apply_exocyclic_rotation(
+        self,
+        coords: np.ndarray,
+        exo_joint_idx: int,
+        angle_rad: float
+    ) -> np.ndarray:
+        """Applies pure Forward Kinematics (FK) rotation to an exocyclic side-chain arm."""
+        if abs(angle_rad) < 1e-7 or exo_joint_idx >= len(self.exo_joints):
+            return coords
+            
+        new_coords = coords.copy()
+        joint = self.exo_joints[exo_joint_idx]
+        a1, a2 = joint.begin_atom_idx, joint.end_atom_idx
+        axis = new_coords[a2] - new_coords[a1]
+        norm = np.linalg.norm(axis)
+        if norm > 1e-6:
+            u = axis / norm
+            rot = ScipyRotation.from_rotvec(u * angle_rad).as_matrix()
+            origin = new_coords[a1]
+            sub_p = new_coords[joint.moving_atom_indices] - origin
+            new_coords[joint.moving_atom_indices] = sub_p.dot(rot.T) + origin
+            
+        return new_coords
+
+    def generate_two_tier_movie(
+        self,
+        engine: DockingEngine
+    ) -> List[Chem.Mol]:
+        """
+        Generates a 3-Phase Multi-Tier Movie:
+        • Phase 1 (Frames 1-40): Macrocyclic Ring Breathing via Inverse Kinematics (IK)
+        • Phase 2 (Frames 41-80): Exocyclic Side-Chain Articulation via Forward Kinematics (FK)
+        • Phase 3 (Frames 81-120): Coordinated Coupled Docking settling into the Keap1 pocket
+        """
+        frames: List[Chem.Mol] = []
+        frame_id = 1
+        
+        # Build OpenMM system once
+        system, _, lig_start, lig_n = engine._build_system(self.mol)
+        integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        context = (
+            mm.Context(system, integrator, engine.platform)
+            if engine.platform
+            else mm.Context(system, integrator)
+        )
+        
+        def _make_frame(c_arr: np.ndarray, move_type: str, detail: str) -> Chem.Mol:
+            nonlocal frame_id
+            full_pos = engine._full_positions_from_coords(c_arr)
+            context.setPositions(full_pos)
+            state = context.getState(getEnergy=True)
+            score_kcal = float(state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) * 0.239006)
+            
+            p1 = c_arr[self.ik_engine.cut_a1]
+            p2 = c_arr[self.ik_engine.cut_a2]
+            gap = abs(np.linalg.norm(p1 - p2) - self.ik_engine.target_bond_length)
+            
+            mol_f = Chem.Mol(self.mol)
+            conf_f = mol_f.GetConformer()
+            for i in range(self.num_atoms):
+                p = c_arr[i]
+                conf_f.SetAtomPosition(i, Point3D(float(p[0]), float(p[1]), float(p[2])))
+                
+            mol_f.SetProp("FRAME_ID", str(frame_id))
+            mol_f.SetProp("TIER_MOVE_TYPE", move_type)
+            mol_f.SetProp("MOVE_DETAIL", detail)
+            mol_f.SetProp("OPENMM_SCORE_KCAL", f"{score_kcal:.2f}")
+            mol_f.SetProp("RING_CLOSURE_GAP_A", f"{gap:.6f}")
+            frame_id += 1
+            return mol_f
+
+        # =========================================================================
+        # PHASE 1: Macrocyclic Ring Breathing via Inverse Kinematics (40 Frames)
+        # =========================================================================
+        t_ring = np.linspace(0, 2 * np.pi, 40, endpoint=False)
+        for t in t_ring:
+            d_angles = {
+                1: float(np.sin(t) * (np.pi / 5.0)),
+                max(2, self.ik_engine.num_joints // 2): float(np.cos(t) * (np.pi / 5.0))
+            }
+            c_ring, _, _ = self.ik_engine.solve_loop_closure(self.base_coords, driver_angles=d_angles)
+            frames.append(_make_frame(c_ring, "TIER_1_RING_IK_BREATHE", "Ring Backbone Flexing (IK Closed)"))
+
+        # =========================================================================
+        # PHASE 2: Exocyclic Side-Chain Articulation via Forward Kinematics (40 Frames)
+        # =========================================================================
+        t_exo = np.linspace(0, 2 * np.pi, 40, endpoint=False)
+        for t in t_exo:
+            c_exo = self.base_coords.copy()
+            # Articulate key exocyclic arms (carboxylate/amide rotamers)
+            for j_idx in range(min(4, len(self.exo_joints))):
+                phase_shift = j_idx * (np.pi / 2.0)
+                angle = float(np.sin(t + phase_shift) * (np.pi / 3.0))
+                c_exo = self.apply_exocyclic_rotation(c_exo, j_idx, angle)
+                
+            frames.append(_make_frame(c_exo, "TIER_2_EXOCYCLIC_FK_ROTATE", "Side-Chain Functional Arms Rotating (FK)"))
+
+        # =========================================================================
+        # PHASE 3: Coupled Two-Tier Pocket Docking (40 Frames)
+        # =========================================================================
+        decay = np.linspace(1.0, 0.0, 40)
+        for i, dec in enumerate(decay):
+            # Combine damped ring breathing with targeted side-chain alignment
+            d_angles = {
+                1: float(np.sin(i * 0.3) * (np.pi / 6.0) * dec),
+                max(2, self.ik_engine.num_joints // 2): float(np.cos(i * 0.3) * (np.pi / 6.0) * dec)
+            }
+            c_coupled, _, _ = self.ik_engine.solve_loop_closure(self.base_coords, driver_angles=d_angles)
+            for j_idx in range(min(3, len(self.exo_joints))):
+                angle = float(np.sin(i * 0.4 + j_idx) * (np.pi / 4.0) * dec)
+                c_coupled = self.apply_exocyclic_rotation(c_coupled, j_idx, angle)
+                
+            frames.append(_make_frame(c_coupled, "TIER_3_COUPLED_DOCKING", "Coupled Two-Tier Docking into Keap1 Pocket"))
+
+        return frames
