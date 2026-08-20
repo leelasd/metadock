@@ -47,6 +47,7 @@ def main():
     min_p.add_argument("-o", "--output", required=True, help="Output SDF file for minimized poses")
     min_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
     min_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    min_p.add_argument("--covalent-res", default=None, help="Target reactive amino acid residue for covalent docking (e.g. CYS145, CYS797, SER195)")
     min_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: dock
@@ -58,6 +59,7 @@ def main():
     dock_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
     dock_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
     dock_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    dock_p.add_argument("--covalent-res", default=None, help="Target reactive amino acid residue for covalent docking (e.g. CYS145, CYS797, SER195)")
     dock_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: tether
@@ -79,6 +81,7 @@ def main():
     mc_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
     mc_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
     mc_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    mc_p.add_argument("--covalent-res", default=None, help="Target reactive amino acid residue for covalent docking (e.g. CYS145, CYS797, SER195)")
     mc_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: ga (Genetic Algorithm -- rDock's own default search engine)
@@ -93,6 +96,7 @@ def main():
     ga_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
     ga_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
     ga_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    ga_p.add_argument("--covalent-res", default=None, help="Target reactive amino acid residue for covalent docking (e.g. CYS145, CYS797, SER195)")
     ga_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: stats
@@ -218,6 +222,7 @@ def main():
             cavity=cavity,
             waters_pdb_path=getattr(args, "waters", None),
             flexible_radius=getattr(args, "flex_radius", None),
+            covalent_res=getattr(args, "covalent_res", None),
         )
         for i, lig in enumerate(ligands):
             res = engine.minimize(lig)
@@ -232,6 +237,7 @@ def main():
             pharma_restr_path=pharma,
             waters_pdb_path=getattr(args, "waters", None),
             flexible_radius=getattr(args, "flex_radius", None),
+            covalent_res=getattr(args, "covalent_res", None),
         )
         for lig_idx, lig in enumerate(ligands):
             print(f"[*] Docking ligand #{lig_idx+1} ({args.runs} runs)...")
@@ -270,6 +276,7 @@ def main():
             pharma_restr_path=pharma,
             waters_pdb_path=getattr(args, "waters", None),
             flexible_radius=getattr(args, "flex_radius", None),
+            covalent_res=getattr(args, "covalent_res", None),
         )
         for lig_idx, lig in enumerate(ligands):
             print(f"[*] Monte Carlo Basin-Hopping docking on ligand #{lig_idx+1} ({args.steps} steps @ {args.temperature}K)...")
@@ -293,6 +300,7 @@ def main():
             pharma_restr_path=pharma,
             waters_pdb_path=getattr(args, "waters", None),
             flexible_radius=getattr(args, "flex_radius", None),
+            covalent_res=getattr(args, "covalent_res", None),
         )
         for lig_idx, lig in enumerate(ligands):
             print(

@@ -45,6 +45,11 @@ from .tether import (
     create_tether_restraint_force,
 )
 from .solvent import load_solvent_waters, create_solvent_tether_force
+from .covalent import (
+    CovalentRestraint,
+    create_covalent_restraint,
+    detect_ligand_warhead,
+)
 
 
 @dataclass
@@ -209,12 +214,14 @@ class DockingEngine:
         pharma_restr_path: Optional[Path | str] = None,
         flexible_radius: Optional[float] = None,
         flexible_residues: Optional[List[int | str]] = None,
+        covalent_res: Optional[str | int] = None,
         weights: Optional[ScoreWeights] = None,
         platform_name: Optional[str] = None,
     ):
         self.receptor_path = Path(receptor_path)
         self.flexible_radius = flexible_radius
         self.flexible_residues = flexible_residues
+        self.covalent_res = covalent_res
         self.weights = weights or ScoreWeights()
 
         # 1. Load Receptor
@@ -266,6 +273,7 @@ class DockingEngine:
         self,
         ligand_mol: Chem.Mol,
         tether_constraints: Optional[List[TetherConstraint]] = None,
+        covalent_restraint: Optional[CovalentRestraint] = None,
     ) -> Tuple[mm.System, MolecularSystem, int, int]:
         """
         Assembles OpenMM System with receptor, waters, ligand, and all scoring forces.
@@ -429,7 +437,31 @@ class DockingEngine:
             solv_force = create_solvent_tether_force(wat_indices, wat_coords)
             system.addForce(solv_force)
 
-        # 7. Ligand Valence Forces (Bonds, Angles, Ring Triangulation, Stereocenter Locks, Dihedrals)
+        # 7. Optional Covalent Adduct Restraints
+        if covalent_restraint is None and self.covalent_res is not None:
+            covalent_restraint = create_covalent_restraint(self.receptor, ligand_mol, self.covalent_res)
+
+        if covalent_restraint is not None:
+            nucl_idx = covalent_restraint.rec_nucleophile_idx
+            anchor_idx = covalent_restraint.rec_nucleophile_anchor_idx
+            el_idx = lig_start + covalent_restraint.lig_electrophile_idx
+
+            cov_bond = mm.HarmonicBondForce()
+            cov_bond.addBond(nucl_idx, el_idx, covalent_restraint.r0_nm, covalent_restraint.k_bond)
+            cov_bond.setForceGroup(GROUP_VALENCE)
+            cov_bond.setName("CovalentAdductBond")
+            system.addForce(cov_bond)
+
+            cov_angle = mm.HarmonicAngleForce()
+            cov_angle.addAngle(anchor_idx, nucl_idx, el_idx, covalent_restraint.theta0_rad, covalent_restraint.k_angle)
+            cov_angle.setForceGroup(GROUP_VALENCE)
+            cov_angle.setName("CovalentAdductAngle")
+            system.addForce(cov_angle)
+
+            add_unique_exclusion(nucl_idx, el_idx)
+            add_unique_exclusion(anchor_idx, el_idx)
+
+        # 8. Ligand Valence Forces (Bonds, Angles, Ring Triangulation, Stereocenter Locks, Dihedrals)
         self._add_ligand_valence_forces(system, ligand_mol, lig_start, fused_systems)
 
         combined_sys = MolecularSystem(
@@ -696,11 +728,25 @@ class DockingEngine:
         self,
         ligand_mol: Chem.Mol,
         tether_constraints: Optional[List[TetherConstraint]] = None,
+        covalent_restraint: Optional[CovalentRestraint] = None,
         max_iterations: int = 500,
         tolerance: float = 0.1,
     ) -> DockingResult:
         """Performs local L-BFGS gradient minimization of ligand pose in cavity."""
-        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints)
+        ligand_mol = Chem.Mol(ligand_mol)
+        if covalent_restraint is None and self.covalent_res is not None:
+            covalent_restraint = create_covalent_restraint(self.receptor, ligand_mol, self.covalent_res)
+
+        if covalent_restraint is not None:
+            conf = ligand_mol.GetConformer()
+            nucl_pos = self.receptor.atoms[covalent_restraint.rec_nucleophile_idx].coord
+            el_pos = np.array(conf.GetAtomPosition(covalent_restraint.lig_electrophile_idx))
+            shift = (nucl_pos + np.array([0.05, 0.05, 0.05])) - el_pos
+            for i in range(ligand_mol.GetNumAtoms()):
+                p = np.array(conf.GetAtomPosition(i)) + shift
+                conf.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
+
+        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint)
         integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
             mm.Context(system, integrator, self.platform)
