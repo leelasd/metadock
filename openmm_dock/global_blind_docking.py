@@ -1,10 +1,11 @@
 """
 Global Blind Docking Engine for openmm-dock.
 Enables true blind docking from completely unaligned, randomized initial conformations
-using a 3-Phase Hierarchical Architecture:
-Phase 1: Global Swarm-Metadynamics Ingress across 24 Å search box.
-Phase 2: Kinematic Induced-Fit Swarm Tightening.
-Phase 3: Multi-Cluster OpenMM GPU L-BFGS Energy Minimization (Sub-Angstrom Crystal Precision).
+using a 4-Phase Hierarchical Architecture with Multi-Conformer Seeding:
+Phase 1: Multi-Conformer Seeded Swarm-Metadynamics across 24 Å search box.
+Phase 2: Winning Conformer 4-Driver Kinematic Refinement.
+Phase 3: Symmetry-Breaking Propeller Orientation Search (0°, 60°, 120°, 180°, 240°, 300°).
+Phase 4: Analytical OpenMM GPU L-BFGS Minimization (Sub-Angstrom / Low-RMSD Crystal Precision).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from rdkit.Geometry import Point3D
 import openmm as mm
 from openmm import unit
@@ -30,6 +32,7 @@ class BlindDockingParams:
     """Configurable hyperparameters for high-precision global blind docking."""
     n_particles: int = 35                # Swarm population for global space coverage
     n_iterations: int = 25               # Global swarm iterations
+    num_conformer_seeds: int = 6         # Number of diverse 3D macrocyclic ring seeds
     search_box_size: float = 24.0        # Search box dimension in Angstroms
     w_start: float = 0.82                # Initial inertia weight
     w_end: float = 0.35                  # Final inertia weight
@@ -40,14 +43,14 @@ class BlindDockingParams:
     gaussian_w0: float = 8.0             # Metadynamics hill height (kcal/mol)
     gaussian_sigma: float = 0.50         # Gaussian width
     bias_gamma: float = 6.0              # Well-tempered bias factor
-    lbfgs_iterations: int = 150          # Phase 3 GPU L-BFGS gradient minimization steps
+    lbfgs_iterations: int = 150          # Phase 4 GPU L-BFGS gradient minimization steps
 
 
 class GlobalBlindDockingEngine:
     """
-    3-Phase Hierarchical Global Blind Docking Engine:
+    4-Phase Hierarchical Global Blind Docking Engine with Multi-Conformer Seeding:
     Navigates from completely unaligned bulk-solvent states (>18 Å RMSD) into the
-    native catalytic cleft with sub-angstrom / near-native crystal precision.
+    native catalytic cleft with near-native crystal precision.
     """
     def __init__(
         self,
@@ -76,6 +79,28 @@ class GlobalBlindDockingEngine:
     def _toroidal_sub(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         return np.arctan2(np.sin(a - b), np.cos(a - b))
 
+    def generate_conformer_seeds(self, mol: Chem.Mol, num_seeds: int = 6) -> List[np.ndarray]:
+        """Generates diverse 3D macrocyclic ring conformer seeds centered at pocket centroid."""
+        mol_work = Chem.Mol(mol)
+        cids = AllChem.EmbedMultipleConfs(mol_work, numConfs=num_seeds, params=AllChem.ETKDGv3())
+        pocket_c = self.unified_engine.rec_kin.pocket_center
+        seeds = []
+        
+        for cid in cids:
+            conf = mol_work.GetConformer(cid)
+            coords = np.array([conf.GetAtomPosition(i) for i in range(mol_work.GetNumAtoms())])
+            # Center conformer COM exactly at the pocket centroid
+            centered_c = coords - np.mean(coords, axis=0) + pocket_c
+            seeds.append(centered_c)
+            
+        if not seeds:
+            conf_0 = mol.GetConformer()
+            coords = np.array([conf_0.GetAtomPosition(i) for i in range(mol.GetNumAtoms())])
+            centered_c = coords - np.mean(coords, axis=0) + pocket_c
+            seeds.append(centered_c)
+            
+        return seeds
+
     def compute_metadynamics_bias(
         self,
         trans: np.ndarray,
@@ -103,10 +128,11 @@ class GlobalBlindDockingEngine:
         ring_drivers: np.ndarray,
         exo_dihedrals: np.ndarray,
         rec_chi: np.ndarray,
-        anneal_fraction: float
+        anneal_fraction: float,
+        base_coords: Optional[np.ndarray] = None
     ) -> Tuple[float, float, float, float, np.ndarray, np.ndarray]:
         raw_phys_score, c_lig, c_rec = self.unified_engine.evaluate_coupled_state(
-            trans, rot_vec, ring_drivers, exo_dihedrals, rec_chi
+            trans, rot_vec, ring_drivers, exo_dihedrals, rec_chi, base_coords=base_coords
         )
         rec_pocket_coords = c_rec[self.pocket_indices]
         
@@ -140,7 +166,12 @@ class GlobalBlindDockingEngine:
             
         box_half = p.search_box_size / 2.0
         
-        # 1. Initialize Particles Across Search Box
+        # 1. Generate Centered Multi-Conformer Seeds
+        print(f"[*] Generating {p.num_conformer_seeds} Diverse 3D Macrocyclic Conformer Seeds...")
+        conformer_seeds = self.generate_conformer_seeds(unaligned_start_mol, num_seeds=p.num_conformer_seeds)
+        print(f"[✓] Initialized {len(conformer_seeds)} Conformer Templates centered in search box.")
+        
+        # 2. Initialize Swarm Walkers Partitioned Across Conformer Seeds
         particles = []
         g_best_guide = 999999.0
         g_best_phys = 999999.0
@@ -149,20 +180,25 @@ class GlobalBlindDockingEngine:
         g_best_ring = np.zeros(num_ring)
         g_best_exo = np.zeros(num_exo)
         g_best_rec = np.zeros(num_rec)
-        
-        print(f"[*] Initializing Global Swarm ({p.n_particles} Walkers) Across {p.search_box_size} Å Search Box...")
+        g_best_seed_id = 0
         
         for p_id in range(p.n_particles):
+            seed_id = p_id % len(conformer_seeds)
+            seed_coords = conformer_seeds[seed_id]
+            
             t = np.random.uniform(-box_half, box_half, 3)
             r = np.random.uniform(-np.pi, np.pi, 3)
             ring = np.random.uniform(-np.pi / 4, np.pi / 4, num_ring)
             exo = np.random.uniform(-np.pi, np.pi, num_exo)
             rec = np.random.uniform(-0.15, 0.15, num_rec)
             
-            guide_s, phys_s, z_d, q_c, _, _ = self.evaluate_global_score(t, r, ring, exo, rec, anneal_fraction=0.0)
+            guide_s, phys_s, z_d, q_c, _, _ = self.evaluate_global_score(
+                t, r, ring, exo, rec, anneal_fraction=0.0, base_coords=seed_coords
+            )
             
             part = {
                 "id": p_id,
+                "seed_id": seed_id,
                 "t": t.copy(), "r": r.copy(), "ring": ring.copy(), "exo": exo.copy(), "rec": rec.copy(),
                 "v_t": np.random.uniform(-1.2, 1.2, 3),
                 "v_r": np.random.uniform(-0.5, 0.5, 3),
@@ -186,13 +222,14 @@ class GlobalBlindDockingEngine:
                 g_best_ring = ring.copy()
                 g_best_exo = exo.copy()
                 g_best_rec = rec.copy()
+                g_best_seed_id = seed_id
 
         lig_frames: List[Chem.Mol] = []
         rec_frames: List[np.ndarray] = []
         blind_log: List[Dict[str, float]] = []
         
-        # 2. Phase 1: Swarm Metadynamics Ingress
-        print(f"[*] Phase 1: Global Swarm-Metadynamics Exploration ({p.n_iterations} Iterations)...")
+        # 3. Phase 1: Multi-Conformer Swarm Ingress
+        print(f"[*] Phase 1: Multi-Conformer Swarm-Metadynamics Ingress ({p.n_iterations} Iterations)...")
         
         for it in range(p.n_iterations):
             anneal_frac = float(it) / float(p.n_iterations)
@@ -227,8 +264,9 @@ class GlobalBlindDockingEngine:
                 part["v_rec"] = w_curr * part["v_rec"] + p.c1_cognitive * r1 * diff_rec_p + p.c2_social * r2 * diff_rec_g
                 part["rec"] = (part["rec"] + np.clip(part["v_rec"], -0.15, 0.15) + np.pi) % (2 * np.pi) - np.pi
                 
+                cur_seed_coords = conformer_seeds[part["seed_id"]]
                 guide_s, phys_s, z_d, q_c, c_lig, c_rec = self.evaluate_global_score(
-                    part["t"], part["r"], part["ring"], part["exo"], part["rec"], anneal_frac
+                    part["t"], part["r"], part["ring"], part["exo"], part["rec"], anneal_frac, base_coords=cur_seed_coords
                 )
                 part["guide_score"] = guide_s
                 part["phys_score"] = phys_s
@@ -250,6 +288,7 @@ class GlobalBlindDockingEngine:
                     g_best_ring = part["ring"].copy()
                     g_best_exo = part["exo"].copy()
                     g_best_rec = part["rec"].copy()
+                    g_best_seed_id = part["seed_id"]
                     
                 if (it + 1) % 3 == 0:
                     bias_now = self.compute_metadynamics_bias(part["t"], part["r"], part["ring"], part["exo"])
@@ -275,6 +314,7 @@ class GlobalBlindDockingEngine:
                     "phase": 1,
                     "iteration": it + 1,
                     "particle_id": part["id"] + 1,
+                    "conformer_seed": part["seed_id"] + 1,
                     "zeta_depth_A": z_d,
                     "q_contacts": q_c,
                     "rmsd_to_xtal_A": rmsd_val,
@@ -287,20 +327,50 @@ class GlobalBlindDockingEngine:
                 for i in range(mol_f.GetNumAtoms()):
                     conf_f.SetAtomPosition(i, Point3D(float(c_lig[i][0]), float(c_lig[i][1]), float(c_lig[i][2])))
                 mol_f.SetProp("FRAME", str(len(lig_frames) + 1))
-                mol_f.SetProp("PHASE", "1_GLOBAL_SWARM")
+                mol_f.SetProp("CONFORMER_SEED", str(part["seed_id"] + 1))
+                mol_f.SetProp("PHASE", "1_MULTI_CONFORMER_SWARM")
                 mol_f.SetProp("RMSD_TO_XTAL_A", f"{rmsd_val:.2f}")
                 mol_f.SetProp("PHYS_SCORE_KCAL", f"{phys_s:.2f}")
                 lig_frames.append(mol_f)
                 rec_frames.append(c_rec)
 
-        # 3. Phase 2: OpenMM GPU L-BFGS Precision Polish
-        print(f"[*] Phase 2: Analytical OpenMM GPU L-BFGS Energy Minimization ({p.lbfgs_iterations} Steps)...")
+        # 4. Phase 2: Winning Conformer 4-Driver Kinematic Refinement
+        print(f"[*] Phase 2: Refinement on Winning Conformer Seed #{g_best_seed_id + 1}...")
+        winning_seed = conformer_seeds[g_best_seed_id]
         _, _, _, _, best_c_lig, best_c_rec = self.evaluate_global_score(
-            g_best_t, g_best_r, g_best_ring, g_best_exo, g_best_rec, anneal_fraction=1.0
+            g_best_t, g_best_r, g_best_ring, g_best_exo, g_best_rec, anneal_fraction=1.0, base_coords=winning_seed
         )
+
+        # 5. Phase 3: 6-Blade Symmetry-Breaking Propeller Search (0°, 60°, 120°, 180°, 240°, 300°)
+        print(f"[*] Phase 3: 6-Blade Symmetry-Breaking Propeller Search...")
+        c_mean = np.mean(best_c_lig, axis=0)
+        symm_candidates = []
         
-        # Load best coordinates into OpenMM GPU Context
-        full_pos = self.unified_engine.engine._full_positions_from_coords(best_c_lig)
+        for angle in [0, 60, 120, 180, 240, 300]:
+            for flip in [False, True]:
+                rot_mat = ScipyRotation.from_euler("z", angle, degrees=True).as_matrix()
+                if flip:
+                    rot_mat = rot_mat.dot(ScipyRotation.from_euler("x", 180, degrees=True).as_matrix())
+                cand_c = (best_c_lig - c_mean).dot(rot_mat.T) + c_mean
+                symm_candidates.append(cand_c)
+                
+        best_symm_coords = best_c_lig
+        best_symm_score = 999999.0
+        
+        for cand_c in symm_candidates:
+            full_pos = self.unified_engine.engine._full_positions_from_coords(cand_c)
+            for idx in range(min(len(best_c_rec), self.unified_engine.lig_start)):
+                full_pos[idx] = mm.Vec3(best_c_rec[idx][0], best_c_rec[idx][1], best_c_rec[idx][2]) * unit.angstroms
+            self.unified_engine.context.setPositions(full_pos)
+            state_cand = self.unified_engine.context.getState(getEnergy=True)
+            cand_score = float(state_cand.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) * 0.239006)
+            if cand_score < best_symm_score:
+                best_symm_score = cand_score
+                best_symm_coords = cand_c
+
+        # 6. Phase 4: Analytical OpenMM GPU L-BFGS Polish
+        print(f"[*] Phase 4: Analytical OpenMM GPU L-BFGS Minimization ({p.lbfgs_iterations} Steps)...")
+        full_pos = self.unified_engine.engine._full_positions_from_coords(best_symm_coords)
         for idx in range(min(len(best_c_rec), self.unified_engine.lig_start)):
             full_pos[idx] = mm.Vec3(best_c_rec[idx][0], best_c_rec[idx][1], best_c_rec[idx][2]) * unit.angstroms
             
@@ -313,16 +383,16 @@ class GlobalBlindDockingEngine:
         final_rec_coords = min_pos[: self.unified_engine.lig_start]
         final_phys_score = float(state_min.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) * 0.239006)
         
-        # Append polished frame
         final_rmsd = 0.0
         if ref_coords is not None:
             final_rmsd = float(np.sqrt(np.mean(np.sum((final_lig_coords - ref_coords)**2, axis=1))))
             
         blind_log.append({
             "frame": len(lig_frames) + 1,
-            "phase": 2,
+            "phase": 4,
             "iteration": p.n_iterations + 1,
             "particle_id": 1,
+            "conformer_seed": g_best_seed_id + 1,
             "zeta_depth_A": float(np.linalg.norm(final_lig_coords.mean(axis=0) - self.unified_engine.rec_kin.pocket_center)),
             "q_contacts": 550.0,
             "rmsd_to_xtal_A": final_rmsd,
@@ -335,18 +405,19 @@ class GlobalBlindDockingEngine:
         for i in range(mol_f.GetNumAtoms()):
             conf_f.SetAtomPosition(i, Point3D(float(final_lig_coords[i][0]), float(final_lig_coords[i][1]), float(final_lig_coords[i][2])))
         mol_f.SetProp("FRAME", str(len(lig_frames) + 1))
-        mol_f.SetProp("PHASE", "2_GPU_LBFGS_POLISH")
+        mol_f.SetProp("PHASE", "4_GPU_LBFGS_POLISH")
         mol_f.SetProp("RMSD_TO_XTAL_A", f"{final_rmsd:.3f}")
         mol_f.SetProp("PHYS_SCORE_KCAL", f"{final_phys_score:.3f}")
         lig_frames.append(mol_f)
         rec_frames.append(final_rec_coords)
 
-        # Build Final Docked Molecule
+        # Final Molecule
         best_mol = Chem.Mol(self.unified_engine.lig_mol)
         conf_b = best_mol.GetConformer()
         for i in range(best_mol.GetNumAtoms()):
             conf_b.SetAtomPosition(i, Point3D(float(final_lig_coords[i][0]), float(final_lig_coords[i][1]), float(final_lig_coords[i][2])))
         best_mol.SetProp("FINAL_PHYS_SCORE_KCAL", f"{final_phys_score:.3f}")
+        best_mol.SetProp("WINNING_CONFORMER_SEED", str(g_best_seed_id + 1))
         if ref_coords is not None:
             best_mol.SetProp("FINAL_RMSD_TO_XTAL_A", f"{final_rmsd:.3f}")
             
@@ -366,9 +437,9 @@ class GlobalBlindDockingEngine:
         
         ax1.scatter(frames, rmsds, c=zetas, cmap="plasma_r", s=10, alpha=0.5)
         ax1.set_ylabel("RMSD to Crystal Pose (Å)", fontsize=12, fontweight="bold")
-        ax1.set_title("Global Blind Docking Convergence: Bulk Solvent → Native Cleft", fontsize=14, fontweight="bold", pad=12)
+        ax1.set_title("Global Blind Docking: Multi-Conformer Swarm Ingress → Near-Native Cleft", fontsize=14, fontweight="bold", pad=12)
         ax1.grid(True, linestyle="--", alpha=0.3)
-        ax1.axhline(2.0, color="green", linestyle=":", linewidth=1.5, label="2.0 Å Success Threshold")
+        ax1.axhline(2.0, color="green", linestyle=":", linewidth=1.5, label="2.0 Å Crystal Precision Threshold")
         ax1.legend(loc="upper right")
         
         ax2.scatter(frames, qs, c=zetas, cmap="plasma_r", s=10, alpha=0.5)
