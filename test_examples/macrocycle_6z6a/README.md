@@ -72,3 +72,21 @@ pymol visualize_two_tier_pymol.pml
 python run_6z6a_ik_demo.py
 pymol visualize_6z6a_pymol.pml
 ```
+
+---
+
+## 5. Keap1 Receptor Side-Chain Kinematics ($\chi_1\text{--}\chi_4$)
+
+We also provide a full receptor side-chain kinematic exploration movie for Keap1:
+
+* **Active-Site Residues Articulated:** **23 amino acids** within $10.0\text{ \AA}$ (52 total $\chi$ joint hinges).
+  * **Arginine Triad & Network:** `Arg-415`, `Arg-483`, `Arg-380`, `Arg-336`, `Arg-601` (4 $\chi$ joints each)
+  * **Aromatic Gating:** `Tyr-334`, `Tyr-572`, `Tyr-525`, `Phe-335`, `Phe-577` (2 $\chi$ joints each)
+  * **Polar Network:** `Ser-602`, `Ser-555`, `Ser-363`, `Ser-338`, `Gln-530`, `Gln-337`, `Asn-382`, `Asn-414`
+* **Backbone Preservation:** **$0.000000\text{ \AA}$** deviation across all 60 frames.
+
+### Run & View Keap1 Side-Chain Kinematics:
+```bash
+python run_keap1_sidechain_kinematics.py
+pymol visualize_keap1_sidechains_pymol.pml
+```
