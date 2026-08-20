@@ -48,3 +48,11 @@ test_examples/*/*_out.sdf
 test_examples/*/*_min.sdf
 test_examples/*/*_dock.sdf
 test_examples/*/*_score.sdf
+
+# Large generated MD trajectory/movie files (regenerable by re-running demo scripts;
+# these exceed GitHub's file size limits, see backup-full-history-with-large-files tag)
+test_examples/*/*_trajectory.pdb
+test_examples/*/*_movie.pdb
+
+# graphify indexing output (regenerable, see /graphify skill)
+graphify-out/
