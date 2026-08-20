@@ -22,22 +22,25 @@ This directory contains comprehensive, reproducible test examples and PyMOL demo
 │ 4. `macrocycle_6z6a/`                  │ Human Keap1 Kelch + 16-Membered Macrocycle│ Damped Least Squares (DLS) Inverse Kinematics (IK)     │
 │                                        │ (PDB: 6Z6A, Ligand: Q9E)                  │ Decoupled Two-Tier Kinematics (Ring IK vs Side-Chain FK│
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 5. `generalized_cv_docking_6z6a/`      │ Generalized Reference-Free CVs (ζ, Q, Rg) │ Universal 2D Free Energy Binding Funnel Reconstruction │
+│ 5. `blind_global_docking_6z6a/`        │ Global Blind Docking from Scratch         │ 30 Walkers flying from bulk solvent (18.97 Å RMSD)     │
+│                                        │ (PDB: 6Z6A Keap1 Macrocycle)              │ Converges into catalytic cleft via Generalized Beacons │
+├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
+│ 6. `generalized_cv_docking_6z6a/`      │ Generalized Reference-Free CVs (ζ, Q, Rg) │ Universal 2D Free Energy Binding Funnel Reconstruction │
 │                                        │ (PDB: 6Z6A Keap1 Macrocycle)              │ True blind predictive docking without crystal reference│
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 6. `macrocycle_swarm_metadynamics_6z6a/│ Swarm Metadynamics (MetaD-PSO) + FES      │ 15 Walkers x 20 Iterations (300 frames)                │
+│ 7. `macrocycle_swarm_metadynamics_6z6a/│ Swarm Metadynamics (MetaD-PSO) + FES      │ 15 Walkers x 20 Iterations (300 frames)                │
 │                                        │ (PDB: 6Z6A Keap1 Macrocycle)              │ 2D Free Energy Surface & Per-Residue Energy Footprint  │
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 7. `receptor_sidechain_kinematics/`    │ Receptor Pocket Side-Chain Kinematics     │ Parameterizes active-site residues by χ₁, χ₂, χ₃, χ₄   │
+│ 8. `receptor_sidechain_kinematics/`    │ Receptor Pocket Side-Chain Kinematics     │ Parameterizes active-site residues by χ₁, χ₂, χ₃, χ₄   │
 │                                        │ (PDB: 6DI9 BTK Kinase)                    │ 60-frame side-chain flexing with 0.000 Å backbone dev  │
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 8. `pharmacophores/`                   │ Kinase Hinge Restraints                   │ Donor/Acceptor flat-bottom harmonic guiding funnels    │
+│ 9. `pharmacophores/`                   │ Kinase Hinge Restraints                   │ Donor/Acceptor flat-bottom harmonic guiding funnels    │
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 9. `solvent/`                          │ Solvated Explicit Waters                  │ Displaceable water scoring (neutral & charged states)  │
+│ 10.`solvent/`                          │ Solvated Explicit Waters                  │ Displaceable water scoring (neutral & charged states)  │
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 10.`tethered/`                         │ Core Tethered MCS Docking                 │ Maximum Common Substructure core coordinate tethering  │
+│ 11.`tethered/`                         │ Core Tethered MCS Docking                 │ Maximum Common Substructure core coordinate tethering  │
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 11.`rna_docking_example/`              │ HIV-1 TAR RNA Binding                     │ Nucleic acid scoring & RNA pocket docking              │
+│ 12.`rna_docking_example/`              │ HIV-1 TAR RNA Binding                     │ Nucleic acid scoring & RNA pocket docking              │
 └────────────────────────────────────────┴───────────────────────────────────────────┴────────────────────────────────────────────────────────┘
 ```
 
@@ -47,6 +50,7 @@ This directory contains comprehensive, reproducible test examples and PyMOL demo
 
 | Benchmark Demo | PyMOL Command | Visualized Features |
 | :--- | :--- | :--- |
+| **Global Blind Docking** | `pymol test_examples/blind_global_docking_6z6a/visualize_blind_docking_pymol.pml` | 30-walker swarm flying from bulk solvent (18.97 Å RMSD) into Keap1 pocket |
 | **Generalized CV Docking & Funnel** | `pymol test_examples/generalized_cv_docking_6z6a/visualize_generalized_cv_pymol.pml` | 300-frame swarm guided by reference-free CVs (ζ, Q, Rg) with 2D Binding Funnel |
 | **Swarm Metadynamics (MetaD-PSO)** | `pymol test_examples/macrocycle_swarm_metadynamics_6z6a/visualize_swarm_metadynamics_pymol.pml` | 300-frame swarm movie with 2D Free Energy Surface & Footprint plots |
 | **Macrocycle Two-Tier IK** | `pymol test_examples/macrocycle_6z6a/visualize_two_tier_pymol.pml` | Decoupled Ring Breathing (Magenta) vs. Side Chains (Yellow) in Keap1 |
