@@ -1,0 +1,5 @@
+# BTK Kinase Hinge Pharmacophore Restraints
+# x y z tolerance ptype
+-17.88   4.46  -0.21  2.5  Aro
+-15.44   4.41   1.32  2.5  Acc
+-14.35   3.79  -2.14  2.5  Don
