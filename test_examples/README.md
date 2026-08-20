@@ -22,8 +22,8 @@ This directory contains comprehensive, reproducible test examples and PyMOL demo
 │ 4. `macrocycle_6z6a/`                  │ Human Keap1 Kelch + 16-Membered Macrocycle│ Damped Least Squares (DLS) Inverse Kinematics (IK)     │
 │                                        │ (PDB: 6Z6A, Ligand: Q9E)                  │ Decoupled Two-Tier Kinematics (Ring IK vs Side-Chain FK│
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 5. `macrocycle_metadynamics_6z6a/`     │ Kinematic Metadynamics (Kin-MetaD)        │ History-dependent Gaussian hills (+25 kcal/mol)        │
-│                                        │ (PDB: 6Z6A Keap1 Macrocycle)              │ Fills local energy wells to escape decoy traps         │
+│ 5. `macrocycle_swarm_metadynamics_6z6a/│ Swarm Metadynamics (MetaD-PSO) + FES      │ 15 Walkers x 20 Iterations (300 frames)                │
+│                                        │ (PDB: 6Z6A Keap1 Macrocycle)              │ Reconstructs 2D Free Energy Surface & Energy Footprint │
 ├────────────────────────────────────────┼───────────────────────────────────────────┼────────────────────────────────────────────────────────┤
 │ 6. `receptor_sidechain_kinematics/`    │ Receptor Pocket Side-Chain Kinematics     │ Parameterizes active-site residues by χ₁, χ₂, χ₃, χ₄   │
 │                                        │ (PDB: 6DI9 BTK Kinase)                    │ 60-frame side-chain flexing with 0.000 Å backbone dev  │
@@ -44,9 +44,8 @@ This directory contains comprehensive, reproducible test examples and PyMOL demo
 
 | Benchmark Demo | PyMOL Command | Visualized Features |
 | :--- | :--- | :--- |
-| **Robotic Kinematics Sweep** | `pymol test_examples/kinematics_workflow/visualize_pymol.pml` | 336-frame joint-by-joint robotic articulation inside BTK pocket |
-| **Kinematic Particle Swarm** | `pymol test_examples/kinematic_pso_demo/visualize_pso_pymol.pml` | 400-frame 20-particle swarm collapsing into the catalytic cleft |
+| **Swarm Metadynamics (MetaD-PSO)** | `pymol test_examples/macrocycle_swarm_metadynamics_6z6a/visualize_swarm_metadynamics_pymol.pml` | 300-frame swarm movie with 2D Free Energy Surface & Footprint plots |
 | **Macrocycle Two-Tier IK** | `pymol test_examples/macrocycle_6z6a/visualize_two_tier_pymol.pml` | Decoupled Ring Breathing (Magenta) vs. Side Chains (Yellow) in Keap1 |
-| **Kinematic Metadynamics** | `pymol test_examples/macrocycle_metadynamics_6z6a/visualize_metadynamics_pymol.pml` | 50-frame movie of macrocycle escaping filled energy wells in Keap1 |
+| **Kinematic Particle Swarm** | `pymol test_examples/kinematic_pso_demo/visualize_pso_pymol.pml` | 400-frame 20-particle swarm collapsing into the catalytic cleft |
+| **Robotic Kinematics Sweep** | `pymol test_examples/kinematics_workflow/visualize_pymol.pml` | 336-frame joint-by-joint robotic articulation inside BTK pocket |
 | **Receptor Side-Chain Kinematics** | `pymol test_examples/receptor_sidechain_kinematics/visualize_sidechains_pymol.pml` | Active-site side chains flexing (χ₁–χ₄) around docked inhibitor GJJ |
-| **Macrocycle In-Pocket IK** | `pymol test_examples/macrocycle_6z6a/visualize_6z6a_pymol.pml` | 60-frame continuous closed-loop breathing in Keap1 Kelch pocket |
