@@ -6,7 +6,7 @@ enabling strain-free conformational flexing and docking of macrocyclic rings.
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
 from scipy.spatial.transform import Rotation as ScipyRotation
 from rdkit import Chem
@@ -14,15 +14,23 @@ from rdkit.Geometry import Point3D
 import openmm as mm
 from openmm import unit
 
-from .kinematics import LigandKinematicTree, TorsionJoint
 from .engine import DockingEngine
+
+
+@dataclass
+class MacrocycleJoint:
+    """Represents a rotatable joint along the macrocyclic ring backbone."""
+    joint_idx: int
+    begin_atom_idx: int       # Origin atom of rotation axis
+    end_atom_idx: int         # Destination atom of rotation axis
+    moving_atom_indices: List[int] # ALL downstream atoms (including hydrogens & sidechains)
 
 
 class MacrocycleInverseKinematics:
     """
     Solves closed-loop Inverse Kinematics for macrocyclic ligands.
     Guarantees that the macrocyclic ring remains 100% closed with 0.000 Å gap
-    while exploring diverse ring-puckering and binding conformations.
+    while all attached hydrogens and side-chain substituents move rigidly with the ring.
     """
     def __init__(self, mol: Chem.Mol, ring_atom_indices: Optional[List[int]] = None):
         self.mol = Chem.Mol(mol)
@@ -37,15 +45,12 @@ class MacrocycleInverseKinematics:
             rings = mol.GetRingInfo().AtomRings()
             macro_rings = [list(r) for r in rings if len(r) >= 9]
             if not macro_rings:
-                # Fallback to largest ring
                 macro_rings = [list(r) for r in rings]
                 macro_rings.sort(key=len, reverse=True)
             self.ring_atoms = macro_rings[0]
         else:
             self.ring_atoms = list(ring_atom_indices)
             
-        print(f"[*] Macrocycle IK Engine initialized on {len(self.ring_atoms)}-membered ring")
-        
         # 2. Select a closure cut bond inside the macrocycle
         self.cut_a1 = self.ring_atoms[0]
         self.cut_a2 = self.ring_atoms[-1]
@@ -53,51 +58,88 @@ class MacrocycleInverseKinematics:
         p2 = self.base_coords[self.cut_a2]
         self.target_bond_length = float(np.linalg.norm(p1 - p2))
         
-        # 3. Identify all rotatable joints along the macrocyclic ring chain
+        # 3. Build the directed backbone chain and identify rotatable single bonds
         self.chain_atoms = self.ring_atoms
-        self.joint_axes: List[Tuple[int, int]] = []
+        self.joints: List[MacrocycleJoint] = []
+        
         for i in range(len(self.chain_atoms) - 1):
             a1 = self.chain_atoms[i]
             a2 = self.chain_atoms[i + 1]
             b = self.mol.GetBondBetweenAtoms(a1, a2)
             if b is not None and b.GetBondType() == Chem.BondType.SINGLE:
-                self.joint_axes.append((a1, a2))
+                # Find ALL downstream atoms on the a2 side (excluding a1 and the cut closure bond)
+                moving = self._find_full_downstream_subtree(a1, a2)
+                self.joints.append(MacrocycleJoint(
+                    joint_idx=len(self.joints),
+                    begin_atom_idx=a1,
+                    end_atom_idx=a2,
+                    moving_atom_indices=moving
+                ))
                 
-        self.num_joints = len(self.joint_axes)
-        print(f"[*] Identified {self.num_joints} rotatable joint hinges along the macrocyclic ring backbone")
+        self.num_joints = len(self.joints)
+        print(f"[*] Macrocycle IK Engine initialized: {self.num_atoms} total atoms | {len(self.ring_atoms)}-membered ring")
+        print(f"[*] Identified {self.num_joints} rotatable joint hinges with full atomic subtree propagation")
+
+    def _find_full_downstream_subtree(self, begin_idx: int, split_idx: int) -> List[int]:
+        """
+        BFS traversal from split_idx to find ALL downstream atoms in the entire molecule
+        (including all attached hydrogens and exocyclic side-chains) without crossing begin_idx
+        or the cut closure bond (cut_a1 - cut_a2).
+        """
+        # Block backwards path to begin_idx and block the cut closure bond
+        blocked_edges = {
+            (min(begin_idx, split_idx), max(begin_idx, split_idx)),
+            (min(self.cut_a1, self.cut_a2), max(self.cut_a1, self.cut_a2))
+        }
+        
+        visited: Set[int] = {split_idx}
+        queue = [split_idx]
+        
+        while queue:
+            curr = queue.pop(0)
+            for nbr in self.mol.GetAtomWithIdx(curr).GetNeighbors():
+                n_idx = nbr.GetIdx()
+                edge = (min(curr, n_idx), max(curr, n_idx))
+                if edge in blocked_edges:
+                    continue
+                if n_idx not in visited:
+                    visited.add(n_idx)
+                    queue.append(n_idx)
+                    
+        return sorted(list(visited))
 
     def solve_loop_closure(
         self,
         coords: np.ndarray,
         driver_angles: Optional[Dict[int, float]] = None,
-        max_iter: int = 25,
+        max_iter: int = 30,
         damping: float = 0.05,
         tolerance: float = 1e-4
     ) -> Tuple[np.ndarray, float, bool]:
         """
         Solves Damped Least Squares (DLS) Inverse Kinematics to close the ring gap.
+        Transforms ALL ring atoms, attached side chains, and hydrogens simultaneously.
         Returns: (closed_coords, final_closure_gap_angstrom, is_converged)
         """
         curr_coords = coords.copy()
         
-        # Apply any requested driver angles on non-closure joints
+        # 1. Apply driver angles on non-closure joints
         if driver_angles:
             for j_idx, angle in driver_angles.items():
-                if j_idx < len(self.joint_axes):
-                    a1, a2 = self.joint_axes[j_idx]
+                if j_idx < len(self.joints):
+                    joint = self.joints[j_idx]
+                    a1 = joint.begin_atom_idx
+                    a2 = joint.end_atom_idx
                     axis = curr_coords[a2] - curr_coords[a1]
                     norm = np.linalg.norm(axis)
                     if norm > 1e-6:
                         u = axis / norm
                         rot = ScipyRotation.from_rotvec(u * angle).as_matrix()
-                        # Rotate subchain from a2 to end
-                        sub_atoms = self.chain_atoms[self.chain_atoms.index(a2):]
                         origin = curr_coords[a1]
-                        sub_p = curr_coords[sub_atoms] - origin
-                        curr_coords[sub_atoms] = sub_p.dot(rot.T) + origin
+                        sub_p = curr_coords[joint.moving_atom_indices] - origin
+                        curr_coords[joint.moving_atom_indices] = sub_p.dot(rot.T) + origin
 
-        # Target closure position for cut_a2 relative to cut_a1
-        # Loop DLS Iterations
+        # 2. Damped Least Squares Loop Closure on the tip-to-anchor gap
         for iteration in range(max_iter):
             p_tip = curr_coords[self.cut_a2]
             p_anchor = curr_coords[self.cut_a1]
@@ -109,17 +151,19 @@ class MacrocycleInverseKinematics:
             if error_val < tolerance:
                 return curr_coords, float(error_val), True
                 
-            # Desired tip position is target_bond_length away along direction
+            # Desired tip position is target_bond_length away from anchor
             if curr_dist > 1e-6:
                 target_tip = p_anchor - (curr_gap_vec / curr_dist) * self.target_bond_length
             else:
-                target_tip = p_anchor + np.array([self.target_bond_length, 0, 0])
+                target_tip = p_anchor + np.array([self.target_bond_length, 0.0, 0.0])
                 
-            delta_e = target_tip - p_tip # (3,) error vector
+            delta_e = target_tip - p_tip # (3,) 3D positional gap vector
             
-            # Construct 3xK Geometric Jacobian Matrix
+            # Construct 3 x K Geometric Jacobian Matrix
             J = np.zeros((3, self.num_joints), dtype=np.float64)
-            for j_idx, (a1, a2) in enumerate(self.joint_axes):
+            for j_idx, joint in enumerate(self.joints):
+                a1 = joint.begin_atom_idx
+                a2 = joint.end_atom_idx
                 axis = curr_coords[a2] - curr_coords[a1]
                 norm = np.linalg.norm(axis)
                 if norm > 1e-6:
@@ -132,20 +176,21 @@ class MacrocycleInverseKinematics:
             inv_JJT = np.linalg.inv(JJT)
             delta_theta = J.T.dot(inv_JJT).dot(delta_e)
             
-            # Apply delta_theta updates to joint subchains
-            for j_idx, (a1, a2) in enumerate(self.joint_axes):
+            # Apply delta_theta updates to all downstream atoms and hydrogens
+            for j_idx, joint in enumerate(self.joints):
                 d_angle = float(delta_theta[j_idx])
                 if abs(d_angle) < 1e-7:
                     continue
+                a1 = joint.begin_atom_idx
+                a2 = joint.end_atom_idx
                 axis = curr_coords[a2] - curr_coords[a1]
                 norm = np.linalg.norm(axis)
                 if norm > 1e-6:
                     u = axis / norm
                     rot = ScipyRotation.from_rotvec(u * d_angle).as_matrix()
-                    sub_atoms = self.chain_atoms[self.chain_atoms.index(a2):]
                     origin = curr_coords[a1]
-                    sub_p = curr_coords[sub_atoms] - origin
-                    curr_coords[sub_atoms] = sub_p.dot(rot.T) + origin
+                    sub_p = curr_coords[joint.moving_atom_indices] - origin
+                    curr_coords[joint.moving_atom_indices] = sub_p.dot(rot.T) + origin
 
         final_dist = np.linalg.norm(curr_coords[self.cut_a1] - curr_coords[self.cut_a2])
         final_err = abs(final_dist - self.target_bond_length)
@@ -157,12 +202,11 @@ class MacrocycleInverseKinematics:
         n_frames: int = 60
     ) -> List[Chem.Mol]:
         """
-        Generates a continuous breathing / conformational flexing movie
-        where Inverse Kinematics maintains exact ring closure at every frame.
+        Generates a continuous breathing / conformational flexing movie in the pocket
+        where Inverse Kinematics maintains exact ring closure and all hydrogens move rigidly.
         """
         frames: List[Chem.Mol] = []
         
-        # Build OpenMM system
         system, _, lig_start, lig_n = engine._build_system(self.mol)
         integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
@@ -171,16 +215,15 @@ class MacrocycleInverseKinematics:
             else mm.Context(system, integrator)
         )
         
-        # Select 2 driver joints
         driver1 = 1
         driver2 = max(2, self.num_joints // 2)
         
         t_values = np.linspace(0, 2 * np.pi, n_frames, endpoint=False)
         for f_idx, t in enumerate(t_values):
-            # Sinusoidal driver perturbations (amplitude ±45°)
+            # Smooth sinusoidal breathing driver perturbations (±30°)
             d_angles = {
-                driver1: float(np.sin(t) * (np.pi / 4.0)),
-                driver2: float(np.cos(t) * (np.pi / 4.0))
+                driver1: float(np.sin(t) * (np.pi / 6.0)),
+                driver2: float(np.cos(t) * (np.pi / 6.0))
             }
             
             closed_coords, gap_err, conv = self.solve_loop_closure(
