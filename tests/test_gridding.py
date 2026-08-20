@@ -21,6 +21,7 @@ from openmm_dock.gridding import (
     GridBox,
     compute_potential_grids,
     create_boundary_penalty_force,
+    _smoothed_vdw_curve,
     STANDARD_VDW_ELEMENTS,
 )
 
@@ -106,7 +107,12 @@ def test_grid_values_match_exact_pairwise_formula_at_grid_points(score_system):
     The critical correctness gate: pick several exact grid-index positions
     (no interpolation involved) and confirm compute_potential_grids's value
     there matches an independently-implemented direct pairwise sum using the
-    same formulas as scoring.py.
+    same formulas as scoring.py. VDW uses smooth_vdw=False here since
+    smoothing is a *deliberate* approximation (see
+    test_smoothed_vdw_curve_matches_raw_away_from_sharp_features below) --
+    this test validates the underlying accumulation math is exact, which is
+    a separate concern from whether the (optional) smoothing approximation
+    itself behaves sensibly.
     """
     receptor, cavity = score_system
     # A small, cheap box (coarse spacing) just for this correctness check --
@@ -115,7 +121,7 @@ def test_grid_values_match_exact_pairwise_formula_at_grid_points(score_system):
     probe_types = ["C", "N", "O"]
 
     t0 = time.time()
-    grids = compute_potential_grids(receptor, box, vdw_probe_types=probe_types)
+    grids = compute_potential_grids(receptor, box, vdw_probe_types=probe_types, smooth_vdw=False)
     elapsed = time.time() - t0
     print(f"\n[test_gridding] compute_potential_grids (coarse box) took {elapsed:.2f}s")
 
@@ -149,6 +155,36 @@ def test_grid_values_match_exact_pairwise_formula_at_grid_points(score_system):
             assert grids["hbacc"][i, j, k] == pytest.approx(expected["hbacc"], rel=1e-6, abs=1e-6)
             assert grids["hyd"][i, j, k] == pytest.approx(expected["hyd"], rel=1e-6, abs=1e-6)
             assert grids["repul"][i, j, k] == pytest.approx(expected["repul"], rel=1e-6, abs=1e-6)
+
+
+def test_smoothed_vdw_curve_matches_raw_away_from_sharp_features():
+    """
+    A windowed *minimum* filter always follows the local downhill slope, and
+    the 4-8 potential's slope never reaches exactly zero except at r->inf --
+    so smoothed <= raw everywhere is the real invariant (not "unchanged far
+    from the well": even in the gentle tail there's some persistent, shrinking
+    bias, since minimum_filter always picks the more-attractive neighbor).
+    What smoothing is actually meant to fix is concentrated where curvature
+    is steep: the wall-region *absolute* correction should dwarf the
+    tail-region one.
+    """
+    sig_comb, eps_comb, soft_delta_nm = 0.35, 0.6, 0.05
+    r_max_nm = 1.2
+    r_samples, e_smoothed = _smoothed_vdw_curve(sig_comb, eps_comb, soft_delta_nm, r_max_nm)
+    e_raw = 4.0 * eps_comb * ((sig_comb / r_samples) ** 8 - (sig_comb / r_samples) ** 4)
+    abs_diff = np.abs(e_raw - e_smoothed)
+
+    # A min-filter can only pull values down (toward the neighboring minimum),
+    # never push them up.
+    assert np.all(e_smoothed <= e_raw + 1e-9)
+
+    # The correction near the steep repulsive wall must be much larger than
+    # in the gentle far tail -- smoothing is doing real, concentrated work
+    # exactly where cubic-spline interpolation struggles, not something
+    # spread evenly (or worse, concentrated in the wrong place) across r.
+    steep_mask = r_samples < sig_comb * 0.9
+    far_mask = r_samples > 0.8
+    assert abs_diff[steep_mask].max() > 10.0 * abs_diff[far_mask].max()
 
 
 def test_boundary_penalty_zero_inside_linear_outside(score_system):

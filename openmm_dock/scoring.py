@@ -8,9 +8,12 @@ quantities rather than a fixed-fraction split of one combined term.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
+import numpy as np
 import openmm as mm
 from openmm import unit
+
+from .gridding import GridBox, create_boundary_penalty_force, STANDARD_VDW_ELEMENTS
 
 # Force group assignments for clean energy decomposition.
 GROUP_VDW_INTER = 0
@@ -221,3 +224,178 @@ def create_combined_search_force(
     force.addGlobalParameter("r_min_polar", repul_distance_nm)
     force.addGlobalParameter("k_repul", repul_k)
     return RDockNonbondedForces([force])
+
+
+class GridSearchForces:
+    """
+    Grid-based analogue of RDockNonbondedForces: same addParticle/
+    addExclusion interface engine.py's _build_system already drives its
+    per-atom loop through, so selecting the grid backend needs no change to
+    that loop -- only to which factory function builds the nonbonded force
+    set. Internally very different from the pairwise wrapper: ligand atoms
+    get registered as one-particle "bonds" on the grid-lookup
+    CustomCompoundBondForces (see create_grid_search_force), while every
+    atom (ligand and receptor/water alike) still needs a slot on the
+    intramolecular CustomNonbondedForce, matching how CustomNonbondedForce
+    requires addParticle called once per system particle in index order.
+    """
+
+    def __init__(
+        self,
+        vdw_forces: Dict[str, mm.CustomCompoundBondForce],
+        nonvdw_force: mm.CustomCompoundBondForce,
+        intra_force: mm.CustomNonbondedForce,
+        boundary_force: mm.CustomExternalForce,
+        probe_params: Dict[str, Tuple[float, float]],
+    ):
+        self._vdw_forces = vdw_forces
+        self._nonvdw_force = nonvdw_force
+        self._intra_force = intra_force
+        self._boundary_force = boundary_force
+        self._sigma_eps_to_type = {(round(s, 6), round(e, 6)): t for t, (s, e) in probe_params.items()}
+        self._next_idx = 0
+        self._ligand_indices: List[int] = []
+        self._interaction_group_finalized = False
+
+    @property
+    def forces(self) -> List[mm.Force]:
+        if not self._interaction_group_finalized:
+            lig_set = set(self._ligand_indices)
+            if lig_set:
+                self._intra_force.addInteractionGroup(lig_set, lig_set)
+            self._interaction_group_finalized = True
+        return list(self._vdw_forces.values()) + [self._nonvdw_force, self._intra_force, self._boundary_force]
+
+    def addParticle(self, params: List[float]) -> int:
+        idx = self._next_idx
+        self._next_idx += 1
+        q, sig, eps, is_don, is_acc, is_hyd, is_lig = params
+
+        self._intra_force.addParticle(params)
+
+        if is_lig >= 0.5:
+            self._ligand_indices.append(idx)
+            self._boundary_force.addParticle(idx, [])
+
+            vdw_type = self._sigma_eps_to_type.get((round(sig, 6), round(eps, 6)))
+            if vdw_type is not None:
+                self._vdw_forces[vdw_type].addBond([idx], [])
+
+            is_polar = 1.0 if (is_don >= 0.5 or is_acc >= 0.5) else 0.0
+            self._nonvdw_force.addBond([idx], [q, is_don, is_acc, is_hyd, is_polar])
+
+        return idx
+
+    def addExclusion(self, i1: int, i2: int) -> None:
+        self._intra_force.addExclusion(i1, i2)
+
+
+def _make_tabulated_function(grid: np.ndarray, box: GridBox) -> mm.Continuous3DFunction:
+    xmin, xmax, ymin, ymax, zmin, zmax = box.bounds_nm
+    nx, ny, nz = box.shape
+    return mm.Continuous3DFunction(
+        nx, ny, nz, grid.flatten(order="F"), xmin, xmax, ymin, ymax, zmin, zmax
+    )
+
+
+def create_grid_search_force(
+    vdw_grids: Dict[str, np.ndarray],
+    vdw_box: GridBox,
+    shared_grids: Dict[str, np.ndarray],
+    shared_box: GridBox,
+    weights: ScoreWeights,
+    vdw_probe_types: Optional[List[str]] = None,
+    cutoff_distance_nm: float = 1.2,
+    soft_delta_nm: float = 0.05,
+    dielectric_slope: float = 2.0,
+    boundary_slope: float = 1e6,
+) -> GridSearchForces:
+    """
+    Grid-interpolated analogue of create_combined_search_force: the same
+    physics (VDW + screened electrostatics + contact H-bond + hydrophobic +
+    short-range polar repulsion), but the intermolecular (ligand-receptor)
+    part is O(1) grid interpolation per ligand atom instead of an O(N_lig x
+    N_receptor) pairwise sum -- see gridding.py for how the grids in
+    `vdw_grids`/`shared_grids` (from compute_potential_grids) are built and
+    why. Intramolecular (ligand-ligand) terms stay exact pairwise,
+    restricted to ligand-ligand pairs via addInteractionGroup, since the
+    ligand is small and this is already cheap.
+
+    vdw_grids/vdw_box and shared_grids/shared_box are deliberately separate:
+    VDW's r^-8 falloff needs a much finer box/spacing to interpolate
+    accurately than the smoother electrostatics/H-bond/hydrophobic/repulsion
+    terms do (empirically ~17% error in combined VDW energy at 0.375 A
+    spacing vs <0.1% for every other term at the same spacing -- see
+    compute_potential_grids' docstring). The boundary penalty uses
+    shared_box (assumed the larger/coarser of the two, i.e. the true search
+    box) since it exists to bound the ligand's rigid-body position, not to
+    track the finer VDW-only lattice.
+
+    `vdw_probe_types` must match the grid keys actually present in
+    `vdw_grids` (default: all of gridding.STANDARD_VDW_ELEMENTS). A ligand
+    atom whose (sigma, epsilon) doesn't match any requested probe type
+    contributes to the intramolecular force only, not the grid-based
+    intermolecular VDW term -- callers (engine.py) should check ligand
+    element coverage against STANDARD_VDW_ELEMENTS before choosing this
+    backend over create_combined_search_force, rather than relying on this
+    silent per-atom omission as the primary safety net.
+    """
+    if vdw_probe_types is None:
+        vdw_probe_types = list(STANDARD_VDW_ELEMENTS)
+
+    vdw_forces: Dict[str, mm.CustomCompoundBondForce] = {}
+    for t in vdw_probe_types:
+        key = f"vdw_{t}"
+        if key not in vdw_grids:
+            continue
+        force = mm.CustomCompoundBondForce(1, "w_vdw * vdwGrid(x1,y1,z1)")
+        force.addTabulatedFunction("vdwGrid", _make_tabulated_function(vdw_grids[key], vdw_box))
+        force.addGlobalParameter("w_vdw", weights.vdw)
+        force.setForceGroup(GROUP_VDW_INTER)
+        force.setName(f"GridVdwForce_{t}")
+        vdw_forces[t] = force
+
+    nonvdw_expr = (
+        "w_pol * q * elecGrid(x1,y1,z1) + "
+        "w_hb * is_don * hbdonGrid(x1,y1,z1) + w_hb * is_acc * hbaccGrid(x1,y1,z1) + "
+        "w_hyd * is_hyd * hydGrid(x1,y1,z1) + "
+        "w_repul * is_polar * repulGrid(x1,y1,z1)"
+    )
+    nonvdw_force = mm.CustomCompoundBondForce(1, nonvdw_expr)
+    for p in ("q", "is_don", "is_acc", "is_hyd", "is_polar"):
+        nonvdw_force.addPerBondParameter(p)
+    nonvdw_force.addTabulatedFunction("elecGrid", _make_tabulated_function(shared_grids["elec"], shared_box))
+    nonvdw_force.addTabulatedFunction("hbdonGrid", _make_tabulated_function(shared_grids["hbdon"], shared_box))
+    nonvdw_force.addTabulatedFunction("hbaccGrid", _make_tabulated_function(shared_grids["hbacc"], shared_box))
+    nonvdw_force.addTabulatedFunction("hydGrid", _make_tabulated_function(shared_grids["hyd"], shared_box))
+    nonvdw_force.addTabulatedFunction("repulGrid", _make_tabulated_function(shared_grids["repul"], shared_box))
+    nonvdw_force.addGlobalParameter("w_pol", weights.polar)
+    nonvdw_force.addGlobalParameter("w_hb", weights.hbond)
+    nonvdw_force.addGlobalParameter("w_hyd", weights.hydrophobic)
+    nonvdw_force.addGlobalParameter("w_repul", weights.repul)
+    nonvdw_force.setForceGroup(GROUP_VDW_INTER)
+    nonvdw_force.setName("GridNonVdwForce")
+
+    intra_expr = (
+        "w_intra_r * (E_vdw + E_polar);"
+        "E_vdw = 4.0 * eps * ((sig / r_eff)^8 - (sig / r_eff)^4);"
+        "E_polar = 138.935456 * (q1 * q2) / (dielectric_slope * r_eff^2);"
+        "r_eff = sqrt(r^2 + soft_delta^2);"
+        "sig = 0.5 * (sig1 + sig2);"
+        "eps = sqrt(eps1 * eps2);"
+    )
+    intra_force = _new_force(intra_expr, GROUP_VDW_INTER, "GridIntraForce", cutoff_distance_nm)
+    intra_force.addGlobalParameter("w_intra_r", weights.intra)
+    intra_force.addGlobalParameter("soft_delta", soft_delta_nm)
+    intra_force.addGlobalParameter("dielectric_slope", dielectric_slope)
+
+    boundary_force = create_boundary_penalty_force(shared_box, ligand_particle_indices=[], slope=boundary_slope)
+    boundary_force.setForceGroup(GROUP_VDW_INTER)
+
+    probe_params: Dict[str, Tuple[float, float]] = {}
+    for t in vdw_forces:
+        from .core import DockAtom
+        probe = DockAtom(idx=-1, name="probe", element=t, sybyl_type=f"{t}.3", charge=0.0, coord=np.zeros(3))
+        probe_params[t] = (probe.sigma, probe.epsilon)
+
+    return GridSearchForces(vdw_forces, nonvdw_force, intra_force, boundary_force, probe_params)
