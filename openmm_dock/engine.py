@@ -175,13 +175,26 @@ class DockingEngine:
         for b in lig_sys.bonds:
             add_unique_exclusion(lig_start + b.atom1, lig_start + b.atom2)
 
-        # Exclude all intra-ring atom pairs from nonbonded force to prevent ring buckling
+        # Compute fused ring systems (connected components of rings)
         ring_info = ligand_mol.GetRingInfo()
-        for ring in ring_info.AtomRings():
-            r_list = list(ring)
-            for i in range(len(r_list)):
-                for j in range(i + 1, len(r_list)):
-                    add_unique_exclusion(lig_start + r_list[i], lig_start + r_list[j])
+        rings = [set(r) for r in ring_info.AtomRings()]
+        fused_systems: List[set[int]] = []
+        for r in rings:
+            merged = False
+            for f in fused_systems:
+                if f & r:
+                    f.update(r)
+                    merged = True
+                    break
+            if not merged:
+                fused_systems.append(r)
+
+        # Exclude all intra-ring and intra-fused-system atom pairs from nonbonded force to prevent ring buckling
+        for f in fused_systems:
+            f_list = sorted(list(f))
+            for i in range(len(f_list)):
+                for j in range(i + 1, len(f_list)):
+                    add_unique_exclusion(lig_start + f_list[i], lig_start + f_list[j])
 
         system.addForce(nb_force)
 
@@ -213,8 +226,8 @@ class DockingEngine:
             solv_force = create_solvent_tether_force(wat_indices, wat_coords)
             system.addForce(solv_force)
 
-        # 7. Ligand Valence Forces (Bonds, Angles, Ring Triangulation, Dihedrals)
-        self._add_ligand_valence_forces(system, ligand_mol, lig_start)
+        # 7. Ligand Valence Forces (Bonds, Angles, Fused Ring Triangulation, Dihedrals)
+        self._add_ligand_valence_forces(system, ligand_mol, lig_start, fused_systems)
 
         combined_sys = MolecularSystem(
             name=f"{self.receptor.name}_{lig_sys.name}",
@@ -229,11 +242,12 @@ class DockingEngine:
         system: mm.System,
         ligand_mol: Chem.Mol,
         lig_start: int,
+        fused_systems: List[set[int]],
     ) -> None:
         """
         Constructs and adds harmonic bond, angle, and torsional forces to the OpenMM System
         to strictly preserve the ligand's chemical geometry (bond lengths, bond angles,
-        aromatic ring planarity, and substituent orientations) during Cartesian minimization and simulated annealing.
+        fused aromatic ring planarity, and substituent orientations) during Cartesian minimization and simulated annealing.
         """
         conf = ligand_mol.GetConformer()
         bond_force = mm.HarmonicBondForce()
@@ -249,23 +263,46 @@ class DockingEngine:
             r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
             bond_force.addBond(a1, a2, r0_nm, 500000.0)
 
-        # 2. Cross-ring Triangulation: locks 5- and 6-membered aromatic & conjugated rings strictly planar
-        ring_info = ligand_mol.GetRingInfo()
-        for ring in ring_info.AtomRings():
-            r_list = list(ring)
-            N = len(r_list)
-            if N in [5, 6]:
-                for i in range(N):
-                    for j in range(i + 2, N):
-                        if not (i == 0 and j == N - 1):  # Non-adjacent cross-ring distance
-                            a1 = r_list[i] + lig_start
-                            a2 = r_list[j] + lig_start
-                            p1 = np.array(conf.GetAtomPosition(r_list[i]))
-                            p2 = np.array(conf.GetAtomPosition(r_list[j]))
-                            r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
-                            bond_force.addBond(a1, a2, r0_nm, 500000.0)
+        # 2. Complete Fused Ring Triangulation: rigidly locks fused aromatic systems (e.g. Purines, Indoles) into strict 2D planes
+        for f in fused_systems:
+            f_list = sorted(list(f))
+            is_aro = all(mol_atom.GetIsAromatic() for mol_atom in [ligand_mol.GetAtomWithIdx(a) for a in f])
+            if is_aro:
+                # Lock all cross-distances in the fused aromatic system
+                for i in range(len(f_list)):
+                    for j in range(i + 1, len(f_list)):
+                        a1 = f_list[i] + lig_start
+                        a2 = f_list[j] + lig_start
+                        p1 = np.array(conf.GetAtomPosition(f_list[i]))
+                        p2 = np.array(conf.GetAtomPosition(f_list[j]))
+                        r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
+                        bond_force.addBond(a1, a2, r0_nm, 500000.0)
 
-        # 3. Harmonic Angles (k = 2000 kJ/(mol*rad^2))
+                # Lock coplanar valence angles of exocyclic substituents attached to this aromatic ring
+                for a in f_list:
+                    ortho_nbrs = [n.GetIdx() for n in ligand_mol.GetAtomWithIdx(a).GetNeighbors() if n.GetIdx() in f]
+                    for nbr in ligand_mol.GetAtomWithIdx(a).GetNeighbors():
+                        nbr_idx = nbr.GetIdx()
+                        if nbr_idx not in f:
+                            for o in ortho_nbrs:
+                                a1 = nbr_idx + lig_start
+                                a2 = o + lig_start
+                                p1 = np.array(conf.GetAtomPosition(nbr_idx))
+                                p2 = np.array(conf.GetAtomPosition(o))
+                                r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
+                                bond_force.addBond(a1, a2, r0_nm, 500000.0)
+            else:
+                # Non-aromatic rings (aliphatic 5/6-membered rings): preserve their 3D chair/envelope shape
+                for i in range(len(f_list)):
+                    for j in range(i + 2, len(f_list)):
+                        a1 = f_list[i] + lig_start
+                        a2 = f_list[j] + lig_start
+                        p1 = np.array(conf.GetAtomPosition(f_list[i]))
+                        p2 = np.array(conf.GetAtomPosition(f_list[j]))
+                        r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
+                        bond_force.addBond(a1, a2, r0_nm, 500000.0)
+
+        # 3. Harmonic Angles for all non-ring angle triplets (k = 2000 kJ/(mol*rad^2))
         for atom in ligand_mol.GetAtoms():
             c_idx = atom.GetIdx()
             neighbors = [nbr.GetIdx() for nbr in atom.GetNeighbors()]
@@ -282,19 +319,7 @@ class DockingEngine:
                         2000.0,
                     )
 
-        # 4. Out-of-plane Improper Dihedrals for all trivalent sp2 / aromatic atoms (keeps substituents planar)
-        for atom in ligand_mol.GetAtoms():
-            nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
-            if len(nbrs) == 3 and (atom.GetIsAromatic() or atom.GetHybridization() == Chem.HybridizationType.SP2):
-                c = atom.GetIdx()
-                # n1 - c - n2 - n3 improper dihedral
-                phi0_rad = float(rdMolTransforms.GetDihedralRad(conf, nbrs[0], c, nbrs[1], nbrs[2]))
-                torsion_force.addTorsion(
-                    nbrs[0] + lig_start, c + lig_start, nbrs[1] + lig_start, nbrs[2] + lig_start,
-                    2, phi0_rad, 500.0
-                )
-
-        # 5. Flexible Rotatable Single Bonds (allows proper torsional search during annealing)
+        # 4. Flexible Rotatable Single Bonds (allows proper torsional search during annealing)
         for b in ligand_mol.GetBonds():
             if not b.IsInRing() and b.GetBondTypeAsDouble() == 1.0:
                 a2 = b.GetBeginAtomIdx()
