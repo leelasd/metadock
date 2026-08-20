@@ -88,34 +88,55 @@ By translating rDock's empirical scoring terms into OpenMM `CustomNonbondedForce
 
 ## 4. Scoring Function Mathematical Formulation in OpenMM
 
-Implemented in `openmm_dock/scoring.py` as a unified `CustomNonbondedForce`:
+Implemented in `openmm_dock/scoring.py` as **six separate `CustomNonbondedForce` objects**,
+each in its own OpenMM force group. Earlier revisions computed one combined
+nonbonded blob and reported `SCORE.INTER.VDW`/`POLAR`/etc. as fixed fractions
+of it (`nb_e * 0.5`, `nb_e * 0.3`, ...). That was cosmetic, not physics: the
+values didn't correspond to anything actually being evaluated. Every term
+below is now its own force and its own real energy.
 
-$$E_{\text{total}} = E_{\text{inter}} + E_{\text{intra}} + E_{\text{cavity}} + E_{\text{pharma}} + E_{\text{tether}} + E_{\text{solvent}}$$
+$$E_{\text{total}} = E_{\text{inter}} + E_{\text{intra}} + E_{\text{restr}} + E_{\text{system}}$$
 
 ### 1. Intermolecular Nonbonded Energy ($E_{\text{inter}}$)
-$$E_{\text{inter}} = w_{\text{vdw}} E_{\text{vdw}} + w_{\text{pol}} E_{\text{polar}} + w_{\text{hb}} E_{\text{hb}} + w_{\text{hyd}} E_{\text{hyd}}$$
+$$E_{\text{inter}} = w_{\text{vdw}} E_{\text{vdw}} + w_{\text{pol}} E_{\text{polar}} + w_{\text{hb}} E_{\text{hb}} + w_{\text{repul}} E_{\text{repul}} + w_{\text{hyd}} E_{\text{hyd}} + E_{\text{const}} + E_{\text{rot}}$$
 
-* **Soft-Core 4–8 Lennard-Jones ($E_{\text{vdw}}$):**
+* **Soft-Core 4–8 Lennard-Jones ($E_{\text{vdw}}$)** — own force, `GROUP_VDW_INTER`:
   $$E_{\text{vdw}} = 4\epsilon \left[ \left(\frac{\sigma}{r_{\text{eff}}}\right)^8 - \left(\frac{\sigma}{r_{\text{eff}}}\right)^4 \right]$$
   where $r_{\text{eff}} = \sqrt{r^2 + \delta^2}$, $\delta = 0.05\text{ nm}$, $\sigma = \frac{\sigma_1 + \sigma_2}{2}$, and $\epsilon = \sqrt{\epsilon_1 \epsilon_2}$.
 
-* **Screened Electrostatics ($E_{\text{polar}}$):**
-  $$E_{\text{polar}} = \frac{138.935456 \cdot q_1 q_2}{D \cdot r_{\text{eff}}^2}$$
+* **Screened Electrostatics + Contact H-Bonding ($E_{\text{polar}}$, $E_{\text{hb}}$)** — own force, `GROUP_POLAR_INTER`:
+  $$E_{\text{polar}} = \frac{138.935456 \cdot q_1 q_2}{D \cdot r_{\text{eff}}^2}, \qquad E_{\text{hb}} = -12.0 \cdot (\text{don}_1 \cdot \text{acc}_2 + \text{don}_2 \cdot \text{acc}_1) \cdot \exp\left( - \frac{(r_{\text{eff}} - 0.28\text{ nm})^2}{0.02} \right)$$
 
-* **Contact Hydrogen Bonding ($E_{\text{hb}}$):**
-  $$E_{\text{hb}} = -12.0 \cdot (\text{don}_1 \cdot \text{acc}_2 + \text{don}_2 \cdot \text{acc}_1) \cdot \exp\left( - \frac{(r_{\text{eff}} - 0.28\text{ nm})^2}{0.02} \right)$$
+* **Short-Range Polar Clash Penalty ($E_{\text{repul}}$)** — own force, `GROUP_REPUL`. The OpenMM analogue of rDock's `RbtPolarIdxSF(ATTR=FALSE)`: a repulsive-only term specific to donor/acceptor atom pairs closer than the ideal H-bond distance, independent of the generic vdW wall:
+  $$E_{\text{repul}} = \Theta(r_{\min} - r_{\text{eff}}) \cdot k_{\text{repul}} \cdot (r_{\min} - r_{\text{eff}})^2, \quad r_{\min} = 0.24\text{ nm}$$
+  applied only between polar (donor-or-acceptor) atom pairs.
 
-* **Hydrophobic Desolvation ($E_{\text{hyd}}$):**
+* **Hydrophobic Desolvation ($E_{\text{hyd}}$)** — own force, `GROUP_HYD`:
   $$E_{\text{hyd}} = -3.0 \cdot (\text{hyd}_1 \cdot \text{hyd}_2) \cdot \exp\left( - \frac{(r_{\text{eff}} - 0.38\text{ nm})^2}{0.04} \right)$$
+
+* **Constant / Solvent-Enablement Penalty ($E_{\text{const}}$)** — not a nonbonded force at all, matching rDock's `RbtConstSF`, which is a true constant rather than distance-dependent: $E_{\text{const}} = w_{\text{const}} \cdot n_{\text{waters}}$ (cost of enabling each explicit active-site water; zero when no waters are present).
+
+* **Rotatable Bond Entropy Penalty ($E_{\text{rot}}$)** — also not a nonbonded force; matches rDock's `RbtRotSF`: $E_{\text{rot}} = w_{\text{rot}} \cdot n_{\text{rot}}$, where $n_{\text{rot}}$ is RDKit's real rotatable-bond count for the ligand topology.
+
+Intramolecular ligand strain ($E_{\text{intra}}$) uses the same VDW/POLAR expressions restricted to ligand-ligand pairs, each in its own group (`GROUP_VDW_INTRA`, `GROUP_POLAR_INTRA`) so it is never conflated with the intermolecular terms.
 
 ### 2. Force Group Decomposition
 By assigning OpenMM forces to specific force groups, exact decomposed energies are computed via `context.getState(getEnergy=True, groups={...})`:
-* `GROUP_NONBONDED = 0`: Intermolecular & intramolecular nonbonded binding energy.
+* `GROUP_VDW_INTER = 0`: Intermolecular soft-core 4-8 Lennard-Jones.
 * `GROUP_VALENCE = 1`: Ligand covalent bonds, angles, ring triangulation, and dihedrals.
 * `GROUP_CAVITY = 2`: Cavity flat-bottom harmonic restraint.
 * `GROUP_PHARMA = 3`: Pharmacophore feature restraints.
 * `GROUP_TETHER = 4`: Template core positional restraints.
 * `GROUP_SOLVENT = 5`: Flexible active-site solvent water tethering.
+* `GROUP_POLAR_INTER = 6`: Intermolecular screened electrostatics + contact H-bond bonus.
+* `GROUP_REPUL = 7`: Short-range polar clash penalty.
+* `GROUP_HYD = 8`: Hydrophobic desolvation contact bonus.
+* `GROUP_VDW_INTRA = 9`: Intramolecular ligand vdW strain.
+* `GROUP_POLAR_INTRA = 10`: Intramolecular ligand electrostatic strain.
+
+`SCORE.INTER.CONST` and `SCORE.INTER.ROT` are computed directly from ligand/solvent topology (not from any force group), since rDock's own `RbtConstSF` and `RbtRotSF` are non-distance-dependent terms.
+
+**Known remaining gap:** `SCORE.SYSTEM` still reports only the solvent tether *restraint* energy, not real water–protein / water–ligand nonbonded energy (rDock's actual `SCORE.SYSTEM.VDW`/`SCORE.SYSTEM.POLAR`). Explicit waters currently only interact nonbonded-wise with the ligand (folded into `SCORE.INTER`); water-protein interactions are not scored. This is a separate, larger change (waters need a third `is_water` particle category, not just `is_lig`) and is out of scope for the decomposition fix.
 
 ---
 

@@ -29,11 +29,12 @@ When docking is naively written as a Python `for` loop calling `context.setPosit
 
 ## 🚀 Key Features
 
-* **rDock Scoring Function via OpenMM `CustomNonbondedForce`:**
+* **rDock Scoring Function via separate OpenMM `CustomNonbondedForce` terms:**
   * Soft-core 4-8 / 6-9 Lennard-Jones to prevent infinite singularities during search.
   * Distance-dependent dielectric screened electrostatics ($\epsilon(r) = D \cdot r$).
-  * Contact hydrogen bonding and hydrophobic desolvation terms.
+  * Contact hydrogen bonding, short-range polar-clash repulsion, and hydrophobic desolvation terms.
   * Intra-molecular ligand nonbonded strain.
+  * Each term (`SCORE.INTER.VDW`/`POLAR`/`REPUL`/`HYD`/`CONST`/`ROT`) is a genuinely independent energy read from its own OpenMM force group — not a fixed fraction of a combined value — matching rDock's own per-term SDF output fields.
 * **Ligand Structural Integrity & Aromatic Ring Planarity:**
   * Harmonic bond stretching ($k_b = 500{,}000\text{ kJ/(mol nm}^2)$) and valence angle bending ($k_\theta = 2000\text{ kJ/(mol rad}^2)$).
   * **Cross-Ring Structural Triangulation:** Eliminates ring buckling/tacoing; locks aromatic rings planar ($\text{deviation} < 0.03\text{ \AA}$).
