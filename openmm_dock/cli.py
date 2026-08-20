@@ -14,6 +14,7 @@ from .core import SDFParser, Mol2Parser
 from .cavity import CavityDefinition
 from .engine import DockingEngine
 from .tether import find_tethered_atoms_mcs
+from .protonation import protonate_ligand_ph
 
 
 def parse_prm_receptor_and_cavity(prm_file: Path) -> Tuple[Path, CavityDefinition]:
@@ -28,6 +29,7 @@ def parse_prm_receptor_and_cavity(prm_file: Path) -> Tuple[Path, CavityDefinitio
 
 def main():
     parser = argparse.ArgumentParser(description="OpenMM Docking Suite (rDock-in-OpenMM)")
+    parser.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # Command: score
@@ -35,6 +37,7 @@ def main():
     score_p.add_argument("-r", "--prm", required=True, help="Path to cavity.prm parameter file")
     score_p.add_argument("-i", "--input", required=True, help="Input SDF / SD ligand file")
     score_p.add_argument("-o", "--output", required=True, help="Output SDF file with scores")
+    score_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: minimize
     min_p = subparsers.add_parser("minimize", help="Locally minimize ligand poses in the receptor cavity")
@@ -42,6 +45,8 @@ def main():
     min_p.add_argument("-i", "--input", required=True, help="Input SDF / SD ligand file")
     min_p.add_argument("-o", "--output", required=True, help="Output SDF file for minimized poses")
     min_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
+    min_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    min_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: dock
     dock_p = subparsers.add_parser("dock", help="Dock ligands using GPU Simulated Annealing MD")
@@ -51,6 +56,8 @@ def main():
     dock_p.add_argument("-n", "--runs", type=int, default=10, help="Number of docking runs / poses (default: 10)")
     dock_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
     dock_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
+    dock_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    dock_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: tether
     teth_p = subparsers.add_parser("tether", help="Dock ligands with MCS template core restraints")
@@ -58,6 +65,8 @@ def main():
     teth_p.add_argument("-ref", "--reference", required=True, help="Reference co-crystal ligand SDF")
     teth_p.add_argument("-i", "--input", required=True, help="Input query ligands SDF")
     teth_p.add_argument("-o", "--output", required=True, help="Output SDF file for tethered docked poses")
+    teth_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
+
     # Command: mc (Monte Carlo Basin-Hopping)
     mc_p = subparsers.add_parser("mc", help="Dock ligands using Metropolis Monte Carlo with Basin-Hopping Minimization")
     mc_p.add_argument("-r", "--prm", required=True, help="Path to cavity.prm parameter file")
@@ -68,6 +77,8 @@ def main():
     mc_p.add_argument("-traj", "--trajectory", default=None, help="Optional output SDF path to save the complete multi-frame Monte Carlo trajectory")
     mc_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
     mc_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
+    mc_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    mc_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: stats
     stats_p = subparsers.add_parser("stats", help="Compute docking statistics (heavy-atom RMSD, valence bond & angle deviations) vs crystal reference")
@@ -144,6 +155,10 @@ def main():
     ligands = SDFParser.load_molecules(input_path)
     print(f"[*] Loaded {len(ligands)} input ligand molecule(s) from {input_path}")
 
+    if getattr(args, "protonate", False):
+        print("[*] Perceiving and setting physiological pH 7.4 ionization states for ligands...")
+        ligands = [protonate_ligand_ph(lig) for lig in ligands]
+
     out_path = Path(args.output)
     if not out_path.name.endswith(".sdf") and not out_path.name.endswith(".sd"):
         out_path = out_path.with_suffix(".sdf")
@@ -160,7 +175,12 @@ def main():
             print(f"  Pose #{i+1}: Total Score = {scores['SCORE']:.3f} | Inter = {scores['SCORE.INTER']:.3f} | Cavity = {scores['SCORE.RESTR.CAVITY']:.3f}")
 
     elif args.command == "minimize":
-        engine = DockingEngine(receptor_path=rec_path, cavity=cavity, waters_pdb_path=getattr(args, "waters", None))
+        engine = DockingEngine(
+            receptor_path=rec_path,
+            cavity=cavity,
+            waters_pdb_path=getattr(args, "waters", None),
+            flexible_radius=getattr(args, "flex_radius", None),
+        )
         for i, lig in enumerate(ligands):
             res = engine.minimize(lig)
             writer.write(res.mol)
@@ -173,6 +193,7 @@ def main():
             cavity=cavity,
             pharma_restr_path=pharma,
             waters_pdb_path=getattr(args, "waters", None),
+            flexible_radius=getattr(args, "flex_radius", None),
         )
         for lig_idx, lig in enumerate(ligands):
             print(f"[*] Docking ligand #{lig_idx+1} ({args.runs} runs)...")
@@ -210,6 +231,7 @@ def main():
             cavity=cavity,
             pharma_restr_path=pharma,
             waters_pdb_path=getattr(args, "waters", None),
+            flexible_radius=getattr(args, "flex_radius", None),
         )
         for lig_idx, lig in enumerate(ligands):
             print(f"[*] Monte Carlo Basin-Hopping docking on ligand #{lig_idx+1} ({args.steps} steps @ {args.temperature}K)...")

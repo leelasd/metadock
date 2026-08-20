@@ -53,6 +53,64 @@ def test_use_case_score():
     assert "SCORE.RESTR.CAVITY" in scores
 
 
+def test_score_decomposition_is_additive():
+    """
+    Each SCORE.INTER.* / SCORE.RESTR.* term must be a real, independently
+    computed energy that sums exactly to its parent total -- not a fixed
+    fraction of one combined nonbonded blob.
+    """
+    rec_path = EXAMPLES_DIR / "score" / "receptor.mol2"
+    prm_path = EXAMPLES_DIR / "score" / "cavity.prm"
+    sdf_path = EXAMPLES_DIR / "score" / "ii.sd"
+
+    cavity = CavityDefinition.from_prm_file(prm_path)
+    engine = DockingEngine(receptor_path=rec_path, cavity=cavity)
+
+    mols = SDFParser.load_molecules(sdf_path)
+    scores = engine.score(mols[0])
+
+    inter_terms = [
+        "SCORE.INTER.VDW",
+        "SCORE.INTER.POLAR",
+        "SCORE.INTER.REPUL",
+        "SCORE.INTER.HYD",
+        "SCORE.INTER.CONST",
+        "SCORE.INTER.ROT",
+    ]
+    for term in inter_terms:
+        assert term in scores
+    assert scores["SCORE.INTER"] == pytest.approx(sum(scores[t] for t in inter_terms), abs=1e-6)
+
+    restr_terms = ["SCORE.RESTR.CAVITY", "SCORE.RESTR.PHARMA", "SCORE.RESTR.TETHER"]
+    assert scores["SCORE.RESTR"] == pytest.approx(sum(scores[t] for t in restr_terms), abs=1e-6)
+
+    assert scores["SCORE"] == pytest.approx(
+        scores["SCORE.INTER"] + scores["SCORE.INTRA"] + scores["SCORE.RESTR"] + scores["SCORE.SYSTEM"],
+        abs=1e-6,
+    )
+
+    # VDW is a genuinely distinct term from POLAR, not a fixed 5:3 fractional split
+    # of one combined nonbonded energy.
+    assert scores["SCORE.INTER.VDW"] != pytest.approx(scores["SCORE.INTER.POLAR"] * (5.0 / 3.0))
+
+
+def test_rotatable_bond_penalty_reflects_topology():
+    """SCORE.INTER.ROT must come from a real rotatable-bond count, not nb_e*const."""
+    rec_path = EXAMPLES_DIR / "score" / "receptor.mol2"
+    prm_path = EXAMPLES_DIR / "score" / "cavity.prm"
+    sdf_path = EXAMPLES_DIR / "score" / "ii.sd"
+
+    from rdkit.Chem import rdMolDescriptors
+
+    cavity = CavityDefinition.from_prm_file(prm_path)
+    engine = DockingEngine(receptor_path=rec_path, cavity=cavity)
+    mol = SDFParser.load_molecules(sdf_path)[0]
+
+    n_rot = rdMolDescriptors.CalcNumRotatableBonds(mol)
+    scores = engine.score(mol)
+    assert scores["SCORE.INTER.ROT"] == pytest.approx(engine.weights.rot * n_rot)
+
+
 def test_use_case_minimize():
     rec_path = EXAMPLES_DIR / "minimize" / "receptor.mol2"
     prm_path = EXAMPLES_DIR / "minimize" / "cavity.prm"
@@ -145,7 +203,7 @@ def test_use_case_rna_docking():
 def test_monte_carlo_basin_hopping():
     rec_path = EXAMPLES_DIR / "solvent" / "receptor.mol2"
     prm_path = EXAMPLES_DIR / "solvent" / "cavity.prm"
-    wat_path = EXAMPLES_DIR / "solvent" / "receptor_solv.pdb"
+    wat_path = EXAMPLES_DIR / "solvent" / "test_waters.pdb"
     lig_path = EXAMPLES_DIR / "solvent" / "lig.sdf"
 
     cavity = CavityDefinition.from_prm_file(prm_path)

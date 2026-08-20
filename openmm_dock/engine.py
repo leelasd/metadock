@@ -13,14 +13,19 @@ import numpy as np
 import openmm as mm
 from openmm import unit
 from rdkit import Chem
-from rdkit.Chem import rdMolTransforms
+from rdkit.Chem import rdMolTransforms, rdMolDescriptors
 
 from .core import MolecularSystem, DockAtom, Mol2Parser, SDFParser, PDBParser
 from .cavity import CavityDefinition, create_cavity_restraint_force
 from .scoring import (
     ScoreWeights,
-    create_unified_rdock_force,
-    GROUP_NONBONDED,
+    create_rdock_nonbonded_forces,
+    GROUP_VDW_INTER,
+    GROUP_VDW_INTRA,
+    GROUP_POLAR_INTER,
+    GROUP_POLAR_INTRA,
+    GROUP_REPUL,
+    GROUP_HYD,
     GROUP_VALENCE,
     GROUP_CAVITY,
     GROUP_PHARMA,
@@ -62,10 +67,14 @@ class DockingEngine:
         cavity_prm_path: Optional[Path | str] = None,
         waters_pdb_path: Optional[Path | str] = None,
         pharma_restr_path: Optional[Path | str] = None,
+        flexible_radius: Optional[float] = None,
+        flexible_residues: Optional[List[int | str]] = None,
         weights: Optional[ScoreWeights] = None,
         platform_name: Optional[str] = None,
     ):
         self.receptor_path = Path(receptor_path)
+        self.flexible_radius = flexible_radius
+        self.flexible_residues = flexible_residues
         self.weights = weights or ScoreWeights()
 
         # 1. Load Receptor
@@ -130,10 +139,55 @@ class DockingEngine:
         lig_start = rec_n + wat_n
         lig_n = len(lig_sys.atoms)
 
+        # 1. Identify flexible residues if requested
+        flex_res_indices = set()
+        if self.flexible_radius is not None:
+            cav_center = self.cavity.center
+            for a in self.receptor.atoms:
+                if np.linalg.norm(a.coord - cav_center) <= self.flexible_radius:
+                    flex_res_indices.add(a.residue_idx)
+        elif self.flexible_residues is not None:
+            flex_res_indices = set(self.flexible_residues)
+
         # 1. Add particles
-        # Receptor atoms: Mass = 0.0 (frozen rigid body)
-        for _ in self.receptor.atoms:
-            system.addParticle(0.0 * unit.dalton)
+        # Receptor atoms: Mass = 0.0 for static atoms, non-zero for flexible pocket residues
+        backbone_restraint = mm.CustomExternalForce("0.5*k_bb*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+        backbone_restraint.addPerParticleParameter("x0")
+        backbone_restraint.addPerParticleParameter("y0")
+        backbone_restraint.addPerParticleParameter("z0")
+        backbone_restraint.addGlobalParameter("k_bb", 5000.0)
+        backbone_restraint.setForceGroup(GROUP_VALENCE)
+        backbone_restraint.setName("ReceptorBackboneRestraint")
+        has_bb_restraints = False
+
+        for idx, a in enumerate(self.receptor.atoms):
+            if a.residue_idx in flex_res_indices:
+                el = a.element.upper()
+                m = 12.011 if el == "C" else (1.008 if el == "H" else (15.999 if el == "O" else (14.007 if el == "N" else 32.06)))
+                system.addParticle(m * unit.dalton)
+                
+                # If backbone, tether with strong harmonic position restraint
+                if a.name.upper() in ["CA", "C", "N", "O", "H", "HA", "P", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'"]:
+                    pos_nm = a.coord * 0.1
+                    backbone_restraint.addParticle(idx, [pos_nm[0], pos_nm[1], pos_nm[2]])
+                    has_bb_restraints = True
+            else:
+                system.addParticle(0.0 * unit.dalton)
+
+        if has_bb_restraints:
+            system.addForce(backbone_restraint)
+
+        # Receptor internal valence bonds for flexible residues
+        if flex_res_indices:
+            rec_bond_force = mm.HarmonicBondForce()
+            for b in self.receptor.bonds:
+                a1 = self.receptor.atoms[b.atom1]
+                a2 = self.receptor.atoms[b.atom2]
+                if a1.residue_idx in flex_res_indices and a2.residue_idx in flex_res_indices:
+                    r0_nm = float(np.linalg.norm(a1.coord - a2.coord) * 0.1)
+                    rec_bond_force.addBond(b.atom1, b.atom2, r0_nm, 500000.0)
+            rec_bond_force.setForceGroup(GROUP_VALENCE)
+            system.addForce(rec_bond_force)
 
         # Water atoms: Mass = 16.0 / 1.0
         if self.waters:
@@ -147,10 +201,10 @@ class DockingEngine:
             m = 12.011 if el == "C" else (1.008 if el == "H" else (15.999 if el == "O" else (14.007 if el == "N" else 32.06)))
             system.addParticle(m * unit.dalton)
 
-        # 2. Unified Nonbonded Force
-        nb_force = create_unified_rdock_force(self.weights)
+        # 2. Nonbonded Forces (separate VDW / POLAR / REPUL / HYD terms for real score decomposition)
+        nb_force = create_rdock_nonbonded_forces(self.weights)
         all_atoms = list(self.receptor.atoms) + (list(self.waters.atoms) if self.waters else []) + list(lig_sys.atoms)
-        
+
         for i, a in enumerate(all_atoms):
             is_lig = 1.0 if i >= lig_start else 0.0
             is_hyd = 1.0 if a.element.upper() in ["C", "CL", "BR", "I", "F"] and not a.is_polar else 0.0
@@ -204,7 +258,8 @@ class DockingEngine:
                 for j in range(i + 1, len(f_list)):
                     add_unique_exclusion(lig_start + f_list[i], lig_start + f_list[j])
 
-        system.addForce(nb_force)
+        for f in nb_force.forces:
+            system.addForce(f)
 
         # 3. Cavity Restraint Force
         lig_indices = list(range(lig_start, lig_start + lig_n))
@@ -403,30 +458,70 @@ class DockingEngine:
             conf.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
         return mol_copy
 
-    def _extract_decomposed_scores(self, context: mm.Context) -> Dict[str, float]:
-        """Calculates decomposed energy terms from OpenMM Context force groups."""
-        nb_e = context.getState(getEnergy=True, groups={GROUP_NONBONDED}).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        val_e = context.getState(getEnergy=True, groups={GROUP_VALENCE}).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        cav_e = context.getState(getEnergy=True, groups={GROUP_CAVITY}).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        pharma_e = context.getState(getEnergy=True, groups={GROUP_PHARMA}).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        tether_e = context.getState(getEnergy=True, groups={GROUP_TETHER}).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        solv_e = context.getState(getEnergy=True, groups={GROUP_SOLVENT}).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+    def _extract_decomposed_scores(self, context: mm.Context, ligand_mol: Chem.Mol) -> Dict[str, float]:
+        """
+        Calculates decomposed energy terms from OpenMM Context force groups.
+        Every SCORE.INTER.* term is read from its own dedicated force group
+        (real per-term physics), not derived as a fixed fraction of a combined
+        nonbonded energy.
+        """
 
-        # Total docking score: nonbonded binding energy + restraints
-        dock_e = nb_e + cav_e + pharma_e + tether_e + solv_e
+        def group_e(group: int) -> float:
+            return context.getState(getEnergy=True, groups={group}).getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole
+            )
+
+        vdw_inter_e = group_e(GROUP_VDW_INTER)
+        vdw_intra_e = group_e(GROUP_VDW_INTRA)
+        polar_inter_e = group_e(GROUP_POLAR_INTER)
+        polar_intra_e = group_e(GROUP_POLAR_INTRA)
+        repul_e = group_e(GROUP_REPUL)
+        hyd_e = group_e(GROUP_HYD)
+        val_e = group_e(GROUP_VALENCE)
+        cav_e = group_e(GROUP_CAVITY)
+        pharma_e = group_e(GROUP_PHARMA)
+        tether_e = group_e(GROUP_TETHER)
+        solv_e = group_e(GROUP_SOLVENT)
+
         conv = 1.0 / 4.184
+        n_waters = len(self.waters.atoms) // 3 if self.waters else 0
+        n_rot = rdMolDescriptors.CalcNumRotatableBonds(ligand_mol)
+
+        inter_vdw = vdw_inter_e * conv
+        inter_polar = polar_inter_e * conv
+        inter_repul = repul_e * conv
+        inter_hyd = hyd_e * conv
+        inter_const = self.weights.const * n_waters
+        inter_rot = self.weights.rot * n_rot
+        score_inter = inter_vdw + inter_polar + inter_repul + inter_hyd + inter_const + inter_rot
+
+        score_intra = (vdw_intra_e + polar_intra_e) * conv
+
+        restr_cavity = cav_e * conv
+        restr_pharma = pharma_e * conv
+        restr_tether = tether_e * conv
+        score_restr = restr_cavity + restr_pharma + restr_tether
+
+        score_system = solv_e * conv
+
+        score_total = score_inter + score_intra + score_restr + score_system
 
         return {
-            "SCORE": dock_e * conv,
-            "SCORE.INTER": (nb_e * 0.8) * conv,
-            "SCORE.INTER.VDW": (nb_e * 0.5) * conv,
-            "SCORE.INTER.POLAR": (nb_e * 0.3) * conv,
-            "SCORE.INTRA": (nb_e * 0.2) * conv,
+            "SCORE": score_total,
+            "SCORE.INTER": score_inter,
+            "SCORE.INTER.VDW": inter_vdw,
+            "SCORE.INTER.POLAR": inter_polar,
+            "SCORE.INTER.REPUL": inter_repul,
+            "SCORE.INTER.HYD": inter_hyd,
+            "SCORE.INTER.CONST": inter_const,
+            "SCORE.INTER.ROT": inter_rot,
+            "SCORE.INTRA": score_intra,
             "SCORE.VALENCE": val_e * conv,
-            "SCORE.RESTR.CAVITY": cav_e * conv,
-            "SCORE.RESTR.PHARMA": pharma_e * conv,
-            "SCORE.RESTR.TETHER": tether_e * conv,
-            "SCORE.SYSTEM": solv_e * conv,
+            "SCORE.RESTR": score_restr,
+            "SCORE.RESTR.CAVITY": restr_cavity,
+            "SCORE.RESTR.PHARMA": restr_pharma,
+            "SCORE.RESTR.TETHER": restr_tether,
+            "SCORE.SYSTEM": score_system,
         }
 
     def score(
@@ -444,7 +539,7 @@ class DockingEngine:
         )
         try:
             context.setPositions(self._get_system_positions(ligand_mol))
-            scores = self._extract_decomposed_scores(context)
+            scores = self._extract_decomposed_scores(context, ligand_mol)
             return scores
         finally:
             del context, integrator
@@ -472,7 +567,7 @@ class DockingEngine:
                 maxIterations=max_iterations,
             )
             state = context.getState(getPositions=True, getEnergy=True)
-            scores = self._extract_decomposed_scores(context)
+            scores = self._extract_decomposed_scores(context, ligand_mol)
             min_mol = self._update_ligand_conformer(ligand_mol, state.getPositions(), lig_start, lig_n)
 
             for k, v in scores.items():
@@ -569,7 +664,7 @@ class DockingEngine:
                 )
 
                 state = context.getState(getPositions=True, getEnergy=True)
-                scores = self._extract_decomposed_scores(context)
+                scores = self._extract_decomposed_scores(context, mol_rand)
                 docked_mol = self._update_ligand_conformer(mol_rand, state.getPositions(), lig_start, lig_n)
 
                 for k, v in scores.items():
@@ -655,7 +750,7 @@ class DockingEngine:
 
             best_mol = copy.deepcopy(curr_mol)
             best_energy = curr_energy
-            best_scores = self._extract_decomposed_scores(context)
+            best_scores = self._extract_decomposed_scores(context, curr_mol)
 
             # Record trajectory frames
             trajectory_frames: List[Chem.Mol] = []
@@ -724,7 +819,7 @@ class DockingEngine:
                     if curr_energy < best_energy:
                         best_energy = curr_energy
                         best_mol = copy.deepcopy(curr_mol)
-                        best_scores = self._extract_decomposed_scores(context)
+                        best_scores = self._extract_decomposed_scores(context, trial_mol)
 
                 # Record frame in trajectory
                 frame_mol = copy.deepcopy(curr_mol)
