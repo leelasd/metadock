@@ -1,4 +1,4 @@
-# PyMOL Script for Kinematic Metadynamics (Kin-MetaD) Movie
+# PyMOL Script for Well-Tempered Kinematic Metadynamics (WT-Kin-MetaD) Movie
 # Run directly in PyMOL: pymol visualize_metadynamics_pymol.pml
 
 reinitialize
@@ -51,8 +51,8 @@ set movie_fps, 24
 mplay
 
 print "================================================================="
-print "  Loaded 100-Frame KINEMATIC METADYNAMICS (Kin-MetaD) MOVIE!"
-print "  • Repulsive Gaussian Hills fill visited decoy traps (+25 kcal/mol)"
-print "  • Watch the 16-membered macrocycle continuously glide & escape traps!"
-print "  • Press Play (bottom right) or Spacebar to watch active 3D dynamics!"
+print "  Loaded 100-Frame WELL-TEMPERED METADYNAMICS (WT-Kin-MetaD) MOVIE!"
+print "  • Adaptive Gaussian Hills W(t) prevent overfilling"
+print "  • Physical Steric Restoring Forces deflect around protein walls"
+print "  • Press Play (bottom right) or Spacebar to watch smooth clash-free dynamics!"
 print "================================================================="

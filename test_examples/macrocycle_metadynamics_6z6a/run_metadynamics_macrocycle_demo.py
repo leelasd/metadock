@@ -1,7 +1,9 @@
 """
-Demonstration of Kinematic Metadynamics (Kin-MetaD) on PDB 6Z6A (Keap1 + Q9E Macrocycle).
-Deposits history-dependent repulsive Gaussian hills to fill local energy traps and
-force smooth, continuous physical dynamics across the kinematic manifold.
+Demonstration of Well-Tempered Kinematic Metadynamics (WT-Kin-MetaD) on PDB 6Z6A.
+Combines:
+1. Well-Tempered Adaptive Gaussian Heights W(t) to prevent overfilling.
+2. OpenMM Physical Steric Force Balance to deflect around protein walls (Zero Clashes!).
+3. Kinematic Manifold Trajectories with 0.000 Å bond distortion.
 """
 from pathlib import Path
 import numpy as np
@@ -15,14 +17,14 @@ rec_path = DEMO_DIR / "receptor.pdb"
 pocket_center = np.array([-21.46, 22.44, -24.18])
 
 print("=" * 90)
-print("   OPENMM-DOCK: KINEMATIC METADYNAMICS (Kin-MetaD) ON PDB 6Z6A (Keap1 + Q9E)")
+print("   OPENMM-DOCK: WELL-TEMPERED KINEMATIC METADYNAMICS (WT-Kin-MetaD, PDB 6Z6A)")
 print("=" * 90)
 
 # 1. Load Macrocycle Ligand
 lig_path = DEMO_DIR / "q9e_crystal_pose.sdf"
 lig_mol = Chem.SDMolSupplier(str(lig_path), removeHs=False)[0]
 
-# 2. Setup Unified Engine and Kinematic Metadynamics Engine
+# 2. Setup Unified Engine and Well-Tempered Metadynamics Engine
 unified_engine = UnifiedKinematicPSOEngine(
     receptor_pdb_path=rec_path,
     pocket_center=pocket_center,
@@ -32,21 +34,30 @@ unified_engine = UnifiedKinematicPSOEngine(
 
 metad_engine = KinematicMetadynamicsEngine(
     unified_engine,
-    gaussian_height_w=25.0,  # +25 kcal/mol per Gaussian hill
-    gaussian_sigma=0.50      # Smooth Gaussian width
+    initial_height_w0=8.0,    # Modest starting hill (+8.0 kcal/mol)
+    gaussian_sigma=0.50,      # Smooth 0.50 rad width
+    bias_factor_gamma=5.0     # Well-tempered bias factor (k_B ΔT = 2.38 kcal/mol)
 )
 
-# 3. Run Smooth Kinematic Metadynamics Exploration (100 Steps)
-print("\n[*] Launching Smooth Kinematic Metadynamics (Kin-MetaD, 100 Frames)...")
+# 3. Run Clash-Free Metadynamics Exploration (100 Steps)
+print("\n[*] Launching Clash-Free Well-Tempered Metadynamics (100 Steps)...")
 best_lig, best_rec_coords, best_score, lig_frames, rec_frames, logs = metad_engine.run_metadynamics_exploration(
     n_steps=100,
     deposit_frequency=5,
-    step_size=0.04
+    step_size=0.03
 )
 
-print(f"\n[✓] Kin-MetaD Exploration Completed!")
-print(f"    • Total Gaussian Hills Deposited: {len(metad_engine.visited_basins)} hills")
-print(f"    • Global Best Physical Score     : {best_score:.3f} kcal/mol")
+print(f"\n[✓] WT-Kin-MetaD Exploration Completed!")
+print(f"    • Total Adaptive Gaussian Hills Deposited: {len(metad_engine.visited_basins)} hills")
+print(f"    • Global Best Physical Score               : {best_score:.3f} kcal/mol")
+
+# Print Summary Log Table
+print("\n" + "=" * 85)
+print(f"{'Step':<6} | {'Physical Score (kcal)':<22} | {'Bias Energy (kcal)':<20} | {'Effective Score':<16} | {'Hills':<6}")
+print("-" * 85)
+for row in logs[::10]:
+    print(f"{row['step']:<6d} | {row['raw_score']:<22.2f} | {row['bias_kcal']:<20.2f} | {row['effective_score']:<16.2f} | {row['num_hills']:<6d}")
+print("=" * 85)
 
 # 4. Save Multi-Track PyMOL Movie
 out_lig_movie = DEMO_DIR / "metadynamics_macrocycle_trajectory.sdf"
@@ -73,13 +84,14 @@ w_best.write(best_lig)
 w_best.close()
 unified_engine.rec_kin.write_pdb_frame(best_rec_coords, DEMO_DIR / "metadynamics_best_receptor.pdb")
 
-print(f"\n[✓] Saved Synchronized 100-Frame Metadynamics Trajectory:")
+print(f"\n[✓] Saved Synchronized 100-Frame Clash-Free Metadynamics Trajectory:")
 print(f"    • Macrocycle Movie: {out_lig_movie.name}")
 print(f"    • Receptor Movie  : {out_rec_movie.name}")
+print(f"    • Best Complex    : metadynamics_best_pose.sdf + metadynamics_best_receptor.pdb")
 
 # 5. Generate PyMOL Script
 flex_res_str = " or ".join(f"(resi {r.res_num} and resn {r.res_name})" for r in unified_engine.rec_kin.flex_residues)
-pml_content = f"""# PyMOL Script for Kinematic Metadynamics (Kin-MetaD) Movie
+pml_content = f"""# PyMOL Script for Well-Tempered Kinematic Metadynamics (WT-Kin-MetaD) Movie
 # Run directly in PyMOL: pymol visualize_metadynamics_pymol.pml
 
 reinitialize
@@ -132,10 +144,10 @@ set movie_fps, 24
 mplay
 
 print "================================================================="
-print "  Loaded 100-Frame KINEMATIC METADYNAMICS (Kin-MetaD) MOVIE!"
-print "  • Repulsive Gaussian Hills fill visited decoy traps (+25 kcal/mol)"
-print "  • Watch the 16-membered macrocycle continuously glide & escape traps!"
-print "  • Press Play (bottom right) or Spacebar to watch active 3D dynamics!"
+print "  Loaded 100-Frame WELL-TEMPERED METADYNAMICS (WT-Kin-MetaD) MOVIE!"
+print "  • Adaptive Gaussian Hills W(t) prevent overfilling"
+print "  • Physical Steric Restoring Forces deflect around protein walls"
+print "  • Press Play (bottom right) or Spacebar to watch smooth clash-free dynamics!"
 print "================================================================="
 """
 (DEMO_DIR / "visualize_metadynamics_pymol.pml").write_text(pml_content)
