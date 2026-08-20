@@ -156,14 +156,6 @@ def decode_chromosome(
     return cavity_center + trans + centered.dot(rot_mat.T)
 
 
-def random_chromosome(rng: np.random.Generator, trans_range: float, n_torsions: int) -> np.ndarray:
-    return np.concatenate([
-        rng.uniform(-trans_range, trans_range, size=3),
-        rng.uniform(-180.0, 180.0, size=3),
-        rng.uniform(-180.0, 180.0, size=n_torsions),
-    ])
-
-
 def tournament_select(
     rng: np.random.Generator, population: List[np.ndarray], scores: List[float], k: int
 ) -> np.ndarray:
@@ -1060,46 +1052,49 @@ class DockingEngine:
         self,
         ligand_mol: Chem.Mol,
         tether_constraints: Optional[List[TetherConstraint]] = None,
-        population_size: int = 40,
-        n_generations: int = 30,
+        population_size: int = 20,
+        n_generations: int = 15,
         mutation_rate: float = 0.2,
-        mutation_trans_sigma: float = 1.0,
-        mutation_rot_sigma: float = 25.0,
-        mutation_torsion_sigma: float = 35.0,
+        mutation_trans_sigma: float = 0.3,
+        mutation_rot_sigma: float = 8.0,
+        mutation_torsion_sigma: float = 15.0,
+        init_trans_sigma: float = 1.0,
+        init_rot_sigma: float = 15.0,
+        init_torsion_sigma: float = 30.0,
         elite_fraction: float = 0.15,
         tournament_size: int = 3,
-        translation_search_radius: Optional[float] = None,
-        fitness_minimize_iterations: int = 25,
-        n_runs: int = 10,
+        fitness_minimize_iterations: int = 10,
+        n_runs: int = 5,
         seed: int = 42,
     ) -> List[DockingResult]:
         """
-        rDock-style Genetic Algorithm docking: this is rDock's own default search
-        engine (population-based GA over rigid-body + torsional DOFs), as opposed
-        to the SAMD / Monte Carlo protocols above, which are OpenMM-native stand-ins.
+        Genetic Algorithm *local refinement* docking: rDock's own default search
+        engine is a population-based GA over rigid-body + torsional DOFs, but
+        blind global GA search (random start anywhere in the cavity) turned out
+        not to reliably recover the binding pose in a practical compute budget
+        even with Lamarckian local-minimization fitness -- a genuinely hard
+        global-optimization problem that real docking codes throw much larger
+        populations/generations of compiled code at. Rather than chase that
+        further, this GA refines the population *around the input ligand_mol's
+        given pose* (e.g. already pharmacophore-aligned or tether-aligned, or
+        simply a reasonable starting geometry the caller supplies), the same
+        "aligned pose + jitter" convention dock_simulated_annealing already
+        uses for its pharma/tether case. This is a much better-posed problem:
+        find the best nearby pose, not find the pocket from scratch.
 
         Each chromosome is [3 translation genes (Å), 3 rigid-body rotation genes
         (Euler degrees), 1 torsion gene per rotatable bond (absolute dihedral,
-        degrees)]. RDKit supplies the ligand topology and rotatable-bond
-        identification; OpenMM (via the shared rDock-scoring Context) supplies
-        the fitness function. Each of `n_runs` independent GA populations evolves
-        for `n_generations` generations with tournament selection, uniform
-        crossover, Gaussian mutation, and elitism; the fittest individual of each
-        run is locally minimized and returned.
-
-        Fitness is evaluated Lamarckian/Baldwinian-style: every candidate pose is
-        given a short local minimization (`fitness_minimize_iterations`) before
-        its energy is read back. A raw, unrelaxed soft-core score is dominated by
-        random steric clashes (any random torsion/orientation typically produces
-        energies orders of magnitude worse than the true minimum), which makes
-        the unrelaxed landscape too noisy for selection to act on -- this mirrors
-        why AutoDock's Lamarckian GA and rDock's own GA+simplex hybrid both
-        couple global GA search with local refinement rather than scoring raw
-        poses. `translation_search_radius` bounds the initial/mutated centroid
-        search box; it defaults to a modest fraction of the cavity radius rather
-        than the full cavity radius, since the cavity restraint's radius already
-        has to enclose the whole ligand extent (much bigger than the sensible
-        range for the ligand *centroid* to wander).
+        degrees)], encoded relative to the input pose (all-zero rigid-body genes
+        exactly reproduce it). The initial population is the input pose plus
+        Gaussian jitter (`init_*_sigma`); each of `n_runs` independent
+        populations then evolves for `n_generations` generations via tournament
+        selection, uniform crossover, smaller-scale Gaussian mutation
+        (`mutation_*_sigma`), and elitism. Fitness is Lamarckian/Baldwinian: a
+        short local minimization (`fitness_minimize_iterations`) is applied
+        before reading back each candidate's energy, since local refinement
+        still benefits from smoothing out torsion-induced steric noise. The
+        fittest individual of each run gets a full final minimization and is
+        returned with genuinely decomposed SCORE.INTER.* fields.
         """
         rng = np.random.default_rng(seed)
 
@@ -1112,6 +1107,16 @@ class DockingEngine:
         conf = ligand_mol.GetConformer()
         base_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
         base_local = base_coords - base_coords.mean(axis=0)
+
+        # Chromosome encoding the input pose exactly: zero rigid-body genes (the
+        # frame is centered on base_local already) + the ligand's own current
+        # torsion angles as absolute gene values.
+        input_torsions = [
+            _dihedral_deg(base_coords[d["ref0"]], base_coords[d["a1"]], base_coords[d["a2"]], base_coords[d["ref3"]])
+            for d in torsion_dofs
+        ]
+        input_centroid_offset = base_coords.mean(axis=0) - self.cavity.center
+        base_chrom = np.concatenate([input_centroid_offset, [0.0, 0.0, 0.0], input_torsions])
 
         # Two systems: a cheap single-force system for the O(pop x gens x runs) inner
         # search loop, and the real decomposed-score system used only once per run
@@ -1132,10 +1137,6 @@ class DockingEngine:
             else mm.Context(report_system, report_integrator)
         )
 
-        if translation_search_radius is not None:
-            trans_range = translation_search_radius
-        else:
-            trans_range = max(min(self.cavity.radius, 8.0), 1.0)
         n_elite = max(1, int(round(elite_fraction * population_size)))
 
         def decode(chrom: np.ndarray) -> np.ndarray:
@@ -1155,7 +1156,15 @@ class DockingEngine:
         results: List[DockingResult] = []
         try:
             for run in range(n_runs):
-                population = [random_chromosome(rng, trans_range, n_t) for _ in range(population_size)]
+                population = [base_chrom.copy()] + [
+                    mutate_chromosome(
+                        rng, base_chrom, mutation_rate=1.0, n_torsions=n_t,
+                        trans_sigma=init_trans_sigma,
+                        rot_sigma=init_rot_sigma,
+                        torsion_sigma=init_torsion_sigma,
+                    )
+                    for _ in range(population_size - 1)
+                ]
                 scores = [fitness(c) for c in population]
 
                 for gen in range(n_generations):

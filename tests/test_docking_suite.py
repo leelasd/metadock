@@ -200,6 +200,38 @@ def test_use_case_rna_docking():
     assert min_res.score < -100.0
 
 
+def test_genetic_algorithm_local_refinement_recovers_pose():
+    """
+    GA refines around the input pose (not blind global search -- see
+    dock_genetic_algorithm docstring for why). Starting from the crystal pose
+    itself, refinement should never land far from it: every returned run's
+    heavy-atom RMSD to the starting pose should stay small.
+    """
+    rec_path = EXAMPLES_DIR / "score" / "receptor.mol2"
+    prm_path = EXAMPLES_DIR / "score" / "cavity.prm"
+    sdf_path = EXAMPLES_DIR / "score" / "xtal-lig.sd"
+
+    cavity = CavityDefinition.from_prm_file(prm_path)
+    engine = DockingEngine(receptor_path=rec_path, cavity=cavity, platform_name="CPU")
+    mol = SDFParser.load_molecules(sdf_path)[0]
+
+    results = engine.dock_genetic_algorithm(
+        mol, population_size=6, n_generations=4, n_runs=2, fitness_minimize_iterations=5, seed=1
+    )
+    assert len(results) == 2
+
+    conf_ref = mol.GetConformer()
+    heavy = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+    p_ref = np.array([conf_ref.GetAtomPosition(i) for i in heavy])
+
+    for r in results:
+        conf_t = r.mol.GetConformer()
+        p_t = np.array([conf_t.GetAtomPosition(i) for i in heavy])
+        rmsd = float(np.sqrt(np.mean(np.sum((p_t - p_ref) ** 2, axis=1))))
+        assert rmsd < 2.0
+        assert "SCORE.INTER.VDW" in r.scores
+
+
 def test_monte_carlo_basin_hopping():
     rec_path = EXAMPLES_DIR / "solvent" / "receptor.mol2"
     prm_path = EXAMPLES_DIR / "solvent" / "cavity.prm"

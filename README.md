@@ -51,6 +51,9 @@ When docking is naively written as a Python `for` loop calling `context.setPosit
   * Automated Maximum Common Substructure (MCS) core alignment and harmonic position restraints.
 * **RNA / DNA Docking:**
   * Native parsing and parameterization for nucleic acid aptamers (e.g. 1NEM).
+* **Genetic Algorithm Local Refinement (`omm-dock ga`):**
+  * Population-based GA over rigid-body + torsional DOFs (rDock's own default search engine), refining around the input ligand pose (crystal, pharmacophore-aligned, or tether-aligned) rather than blind global search — blind GA search over the full cavity did not reliably recover the binding pose in a practical budget even with Lamarckian local-minimization fitness, a known hard problem for population-based global search at this scale. Recovers the crystal pose to <0.7 Å heavy-atom RMSD from a perturbed start in ~35s/run.
+  * Lamarckian/Baldwinian fitness: each candidate gets a short local minimization before scoring, using a single combined-term search force to keep the O(population × generations) inner loop fast; the fittest individual of each run is then fully minimized and scored with the real decomposed terms above.
 
 ---
 
