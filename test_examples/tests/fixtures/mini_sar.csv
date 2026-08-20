@@ -1,0 +1,7 @@
+smiles,name,pic50,active,assay_date
+c1ccc2ncccc2c1,CPD001,7.2,1,2025-01-10
+c1ccncc1,CPD002,5.1,0,2025-01-10
+c1ccc(N)cc1,CPD003,6.8,1,2025-01-15
+c1ccc(O)cc1,CPD004,4.9,0,2025-02-01
+c1cccc2ccccc12,CPD005,7.5,1,2025-02-15
+c1ccc(Cl)cc1,CPD006,5.3,0,2025-03-01

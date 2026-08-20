@@ -1,0 +1,27 @@
+name: Docker Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download rDock tarball
+        run: |
+          wget -q -O rdock-legacy-24.04.204_debian-11_g++_x86_64.tar.gz \
+            https://github.com/CBDD/rDock/releases/download/v24.04.204-legacy/rdock-legacy-24.04.204_debian-11_g%2B%2B_x86_64.tar.gz
+
+      - name: Build Docker image
+        run: |
+          docker build --platform linux/amd64 -t rxdock:latest .
+
+      - name: Smoke test — verify rbdock binary runs
+        run: |
+          docker run --rm rxdock:latest rbdock -h

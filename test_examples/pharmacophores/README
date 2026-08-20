@@ -1,0 +1,2 @@
+rbdock -r cavity.prm -p dock.prm -i xtal-lig.sd -o output -T 1  -n 10 -s 42
+

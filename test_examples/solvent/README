@@ -1,0 +1,9 @@
+https://www.rxdock.org/documentation/devel/html/reference-guide/file-formats.html?highlight=solvent
+Check the file format here
+
+>> rbdock -r cavity.prm -p minimise.prm -i lig.sdf -o output -T 1  
+
+>> rbcavity -r cavity.prm -d 
+
+>> isosurface test, cavity_cav1, 0.6 
+This is for visualizing cavity using Pymol

@@ -1,0 +1,34 @@
+***********************************************
+The RxDock molecular docking program is licensed under GNU LGPL version 3.
+RxDock is maintained by Vedran Miletić, Patrik Nikolić, and Luka Vretenar.
+Visit https://www.rxdock.org/ for more information.
+Executable:	rbcavity/0.1.0
+Library:	librxdock.so/0.1.0
+RBT_ROOT:	/Users/leeladodda/anaconda3/envs/vscreen/share/rxdock-2013.1.1_148c5bd1-1
+RBT_HOME:	/Users/leeladodda
+Current dir:	/Users/leeladodda/Software/rxdock-master/examples/RNA_rDock_TestSet/1nem
+Date:		Fri Nov 27 12:10:49 2020
+***********************************************
+Command line arguments:
+-r 1nem_rdock.prm
+-W
+
+MAPPER
+CLASS	RbtLigandSiteMapper
+ENABLED	TRUE
+GRIDSTEP	0.5
+MAX_CAVITIES	1
+MIN_VOLUME	100
+NAME	MAPPER
+RADIUS	4.0
+REF_MOL	1nem_lig.sd
+SMALL_SPHERE	1.0
+TRACE	0
+VOL_INCR	0.0
+
+
+DOCKING SITE
+Total volume 1306.25 A^3
+Cavity #1	Size=10450 points; Vol=1306.25 A^3; Min=(-8.5,-8.5,-5); Max=(10,7,10); Center=(0.514737,-0.16,2.19498); Extent=(18.5,15.5,15)
+
+Cav = 10450; total = 10450

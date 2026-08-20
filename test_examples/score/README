@@ -1,0 +1,1 @@
+rbdock -r cavity.prm -p score.prm -i ii.sd -o output -T 2 -n 1 

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openmm-dock"
+version = "0.1.0"
+description = "GPU-accelerated molecular docking and scoring powered by OpenMM"
+authors = [{name = "Leela S. Dodda"}]
+requires-python = ">=3.9"
+dependencies = [
+    "openmm>=8.0",
+    "rdkit",
+    "numpy",
+    "scipy",
+    "pandas",
+]
+
+[project.scripts]
+omm-dock = "openmm_dock.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["openmm_dock*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

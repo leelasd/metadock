@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["scoring_optimizer"]
+
+[project]
+name = "scoring-optimizer"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "rdkit>=2023.9",
+    "optuna>=3.5",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scikit-learn>=1.4",
+    "scipy>=1.12",
+    "jinja2>=3.1",
+    "click>=8.1",
+]
+
+[project.scripts]
+scoring-optimizer = "scoring_optimizer.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=4"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.coverage.run]
+data_file = ".coverage"
+parallel = false
+source = ["scoring_optimizer"]
+
+[tool.coverage.report]
+show_missing = true

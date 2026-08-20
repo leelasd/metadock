@@ -1,0 +1,41 @@
+{# scoring_optimizer/templates/cavity.prm.j2 #}
+RBT_PARAMETER_FILE_V1.00
+TITLE {{ title }}
+
+RECEPTOR_FILE {{ receptor_file }}
+RECEPTOR_FLEX 3.0
+
+SECTION MAPPER
+    SITE_MAPPER     RbtLigandSiteMapper
+    REF_MOL         {{ ref_mol }}
+    RADIUS          6.0
+    SMALL_SPHERE    1.0
+    MIN_VOLUME      100
+    MAX_CAVITIES    1
+    VOL_INCR        0.0
+    GRIDSTEP        0.5
+END_SECTION
+
+SECTION CAVITY
+    SCORING_FUNCTION    RbtCavityGridSF
+    WEIGHT              {{ "%.4f" % cavity_weight }}
+END_SECTION
+
+SECTION PHARMA
+    SCORING_FUNCTION    RbtPharmaSF
+    WEIGHT              {{ "%.4f" % pharma_weight }}
+    CONSTRAINTS_FILE    {{ pharma_restr_file }}
+END_SECTION
+{% if waters %}
+
+SECTION SOLVENT
+{% for w in waters %}
+    FILE            water_{{ loop.index }}.pdb
+{% endfor %}
+    TRANS_MODE      TETHERED
+    ROT_MODE        TETHERED
+    MAX_TRANS       1.0
+    MAX_ROT         30.0
+    OCCUPANCY       0.5
+END_SECTION
+{% endif %}
