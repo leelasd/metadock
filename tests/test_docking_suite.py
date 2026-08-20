@@ -3,6 +3,7 @@ Comprehensive test suite for openmm_dock covering all 6 use cases from rxdock-de
 """
 from pathlib import Path
 import pytest
+import numpy as np
 from rdkit import Chem
 
 from openmm_dock.core import Mol2Parser, SDFParser, PDBParser
@@ -139,3 +140,45 @@ def test_use_case_rna_docking():
     lig_mol = SDFParser.load_molecules(lig_path)[0]
     min_res = engine.minimize(lig_mol)
     assert min_res.score < -100.0
+
+
+def test_monte_carlo_basin_hopping():
+    rec_path = EXAMPLES_DIR / "solvent" / "receptor.mol2"
+    prm_path = EXAMPLES_DIR / "solvent" / "cavity.prm"
+    wat_path = EXAMPLES_DIR / "solvent" / "receptor_solv.pdb"
+    lig_path = EXAMPLES_DIR / "solvent" / "lig.sdf"
+
+    cavity = CavityDefinition.from_prm_file(prm_path)
+    engine = DockingEngine(receptor_path=rec_path, cavity=cavity, waters_pdb_path=wat_path)
+
+    lig_mol = SDFParser.load_molecules(lig_path)[0]
+    mc_res = engine.dock_monte_carlo(lig_mol, n_steps=20, temperature_k=300.0)
+
+    assert mc_res.score < -100.0
+    assert mc_res.trajectory is not None
+    assert len(mc_res.trajectory) == 21
+    assert "MC_FRAME" in mc_res.trajectory[0].GetPropNames()
+
+
+def test_fluorobenzene_and_aromatic_planarity():
+    lig_path = EXAMPLES_DIR / "pharmacophores" / "xtal-lig.sd"
+    prm_path = EXAMPLES_DIR / "pharmacophores" / "cavity.prm"
+    rec_path = EXAMPLES_DIR / "pharmacophores" / "receptor.mol2"
+    restr_path = EXAMPLES_DIR / "pharmacophores" / "pharma.restr"
+
+    cavity = CavityDefinition.from_prm_file(prm_path)
+    engine = DockingEngine(receptor_path=rec_path, cavity=cavity, pharma_restr_path=restr_path)
+
+    lig_mol = SDFParser.load_molecules(lig_path)[0]
+    res = engine.minimize(lig_mol)
+    conf = res.mol.GetConformer()
+
+    # Verify all aromatic rings remain strictly planar (max deviation < 0.05 Å)
+    for ring in res.mol.GetRingInfo().AtomRings():
+        if all(res.mol.GetAtomWithIdx(i).GetIsAromatic() for i in ring):
+            r_coords = np.array([conf.GetAtomPosition(i) for i in ring])
+            centered = r_coords - np.mean(r_coords, axis=0)
+            _, _, vh = np.linalg.svd(centered)
+            normal = vh[2]
+            dist_to_plane = np.abs(np.dot(centered, normal))
+            assert np.max(dist_to_plane) < 0.05

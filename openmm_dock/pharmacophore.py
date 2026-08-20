@@ -206,6 +206,16 @@ def align_ligand_to_pharmacophore(mol: Chem.Mol, pharma_points: List[PharmaPoint
     conf = mol_copy.GetConformer()
     features = find_ligand_pharma_features(mol_copy)
 
+    # 1. Translate molecule center to the center of the pharmacophore points first
+    target_center = np.mean([p.coords for p in pharma_points], axis=0)
+    current_center = np.mean([conf.GetAtomPosition(i) for i in range(mol_copy.GetNumAtoms())], axis=0)
+    trans = target_center - current_center
+    for i in range(mol_copy.GetNumAtoms()):
+        p = np.array(conf.GetAtomPosition(i)) + trans
+        conf.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
+
+    # 2. Match distinct features for each pharmacophore point
+    used_features = set()
     pt_coords = []
     feat_coords = []
     for p in pharma_points:
@@ -216,15 +226,21 @@ def align_ligand_to_pharmacophore(mol: Chem.Mol, pharma_points: List[PharmaPoint
         if not m_feats:
             continue
 
+        best_f_key = None
         best_c = None
         min_d = float("inf")
         for f in m_feats:
+            f_key = tuple(sorted(f))
+            if f_key in used_features and len(m_feats) > len(used_features):
+                continue
             fc = np.mean([conf.GetAtomPosition(a) for a in f], axis=0)
             d = np.linalg.norm(fc - p.coords)
             if d < min_d:
                 min_d = d
                 best_c = fc
+                best_f_key = f_key
         if best_c is not None:
+            used_features.add(best_f_key)
             pt_coords.append(p.coords)
             feat_coords.append(best_c)
 
