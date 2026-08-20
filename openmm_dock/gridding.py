@@ -143,6 +143,25 @@ def _smoothed_vdw_curve(
     0.008nm -> -1.0%, 0.005nm -> +6.1%, 0nm (unsmoothed) -> +17%. 0.008 nm
     is the empirically-tightest point found in that sweep.
 
+    IMPORTANT, found later (engine.py's dock_genetic_algorithm docstring has
+    the full story): re-sweeping r_smooth_nm on a genuinely *clashing* pose
+    (not the relaxed one above) showed the *energy* error at 0.008nm is still
+    good (4.75%, actually the best of the values tried -- 0.1875nm/0.375nm/
+    0.5nm/0.75nm all landed at >100% error, so AutoGrid's own window-vs-
+    spacing ratio does not generalize to this steeper potential and widening
+    r_smooth_nm is not a fix for anything). But even at that good 4.75%
+    energy accuracy, the *gradient* OpenMM's Continuous3DFunction cubic
+    spline derives from this table was wildly wrong at the same pose (mean
+    per-atom force error ~36,500 kJ/mol/nm) -- a small value-level
+    interpolation error at a steep point implies a large slope error, and no
+    r_smooth_nm value fixes that, because it's a property of interpolating a
+    r^-8 function on a fixed lattice, not of this particular smoothing
+    choice. The actual fix lives at the call site: don't run a
+    gradient-following minimizer against this grid when a candidate pose is
+    still badly clashing (see minimize_clash_ceiling_kj in engine.py) --
+    trust this table's *energy* values (they're good) without trusting its
+    *derivative* in that regime.
+
     Returns (r_samples, e_samples) suitable for np.interp lookup by r_eff.
     """
     r_samples = np.linspace(soft_delta_nm, r_max_nm, n_samples)
@@ -235,7 +254,23 @@ def compute_potential_grids(
     r_max_nm = math.sqrt(cutoff_sq + soft_delta_nm ** 2)
     curve_cache: Dict[Tuple[str, float, float], Tuple[np.ndarray, np.ndarray]] = {}
 
-    for a in receptor.atoms:
+    # Pre-filter to receptor atoms whose cutoff-padded position actually
+    # overlaps the box -- a receptor typically has thousands of atoms, most
+    # of them nowhere near a cavity-sized box, and _index_window's own
+    # per-axis clipping would empty-skip them anyway (see the i0>=i1 guard
+    # below). Doing that reject/accept check once, vectorized over the whole
+    # receptor, instead of per-atom in the main Python loop, is a pure
+    # speed-up with the identical accept set -- not an approximation.
+    xmin, xmax, ymin, ymax, zmin, zmax = box.bounds_nm
+    coords_nm = receptor.coordinates * 0.1
+    in_range = (
+        (coords_nm[:, 0] >= xmin - cutoff_nm) & (coords_nm[:, 0] <= xmax + cutoff_nm) &
+        (coords_nm[:, 1] >= ymin - cutoff_nm) & (coords_nm[:, 1] <= ymax + cutoff_nm) &
+        (coords_nm[:, 2] >= zmin - cutoff_nm) & (coords_nm[:, 2] <= zmax + cutoff_nm)
+    )
+    relevant_atoms = [a for a, keep in zip(receptor.atoms, in_range) if keep]
+
+    for a in relevant_atoms:
         a_coord_nm = a.coord * 0.1
 
         i0, i1 = _index_window(x_axis, a_coord_nm[0], cutoff_nm)

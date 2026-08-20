@@ -22,6 +22,7 @@ from .scoring import (
     ScoreWeights,
     create_rdock_nonbonded_forces,
     create_combined_search_force,
+    create_grid_search_force,
     GROUP_VDW_INTER,
     GROUP_VDW_INTRA,
     GROUP_POLAR_INTER,
@@ -34,6 +35,7 @@ from .scoring import (
     GROUP_TETHER,
     GROUP_SOLVENT,
 )
+from .gridding import GridBox, compute_potential_grids, STANDARD_VDW_ELEMENTS
 from .pharmacophore import (
     PharmaPoint,
     parse_pharma_restr,
@@ -270,6 +272,13 @@ class DockingEngine:
         self.flexible_residues = flexible_residues
         self.covalent_res = covalent_res
         self.weights = weights or ScoreWeights()
+        # Lazily populated by _ensure_grid_cache: {"box": GridBox, "shared":
+        # {name: ndarray}, "vdw": {element: ndarray}}. Grid values are
+        # weight-independent (weights apply at force-eval time), and the
+        # receptor/cavity never change after __init__, so this cache is safe
+        # for the engine's whole lifetime -- computed once, reused by every
+        # dock_* call, every GA generation, every SA move (see gridding.py).
+        self._grid_cache: Optional[Dict[str, Any]] = None
 
         # 1. Load Receptor
         if self.receptor_path.suffix.lower() == ".mol2":
@@ -428,26 +437,90 @@ class DockingEngine:
             conf2.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
         return mol_copy
 
+    def _ensure_grid_cache(self, required_types: set) -> None:
+        """
+        Lazily computes and extends self._grid_cache so it covers at least
+        `required_types` VDW element channels. First call also computes the
+        5 shared (elec/hbdon/hbacc/hyd/repul) grids once, over a box sized
+        for self.cavity + a ligand margin. Deliberately does *not* precompute
+        all 10 STANDARD_VDW_ELEMENTS up front (the plan's original phrasing)
+        -- a receptor-wide grid channel for an element type no ligand in the
+        session ever uses would be wasted time/memory, and per-atom windowed
+        accumulation cost only depends on the number of receptor atoms and
+        the cutoff (not on how many channels are requested), so extending
+        the cache incrementally as new elements show up is strictly cheaper
+        with no accuracy cost -- results are identical to computing
+        everything up front.
+        """
+        if self._grid_cache is None:
+            box = GridBox.from_cavity(self.cavity, ligand_margin_ang=6.0, spacing_ang=0.375)
+            shared = compute_potential_grids(
+                self.receptor, box, vdw_probe_types=[], compute_vdw=False, compute_shared=True
+            )
+            self._grid_cache = {"box": box, "shared": shared, "vdw": {}}
+
+        missing = [t for t in required_types if t not in self._grid_cache["vdw"]]
+        if missing:
+            new_vdw = compute_potential_grids(
+                self.receptor, self._grid_cache["box"], vdw_probe_types=missing,
+                compute_vdw=True, compute_shared=False,
+            )
+            for t in missing:
+                self._grid_cache["vdw"][t] = new_vdw[f"vdw_{t}"]
+
+    def _get_grid_search_forces(self, lig_sys: MolecularSystem):
+        """
+        Returns a scoring.GridSearchForces for this ligand's element set, or
+        None if the ligand contains an element outside
+        gridding.STANDARD_VDW_ELEMENTS (e.g. a metal) -- the documented,
+        explicit fallback signal create_grid_search_force's docstring asks
+        callers to check for, rather than relying on its own silent
+        per-atom omission as the safety net.
+        """
+        required = {a.element.upper() for a in lig_sys.atoms}
+        if not required.issubset(set(STANDARD_VDW_ELEMENTS)):
+            return None
+
+        self._ensure_grid_cache(required)
+        vdw_subset = {f"vdw_{t}": self._grid_cache["vdw"][t] for t in required}
+        box = self._grid_cache["box"]
+        return create_grid_search_force(
+            vdw_subset, box, self._grid_cache["shared"], box, self.weights,
+            vdw_probe_types=list(required),
+        )
+
     def _build_system(
         self,
         ligand_mol: Chem.Mol,
         tether_constraints: Optional[List[TetherConstraint]] = None,
         covalent_restraint: Optional[CovalentRestraint] = None,
-        fast_search: bool = False,
+        fast_search: bool | str = False,
     ) -> Tuple[mm.System, MolecularSystem, int, int]:
         """
         Assembles OpenMM System with receptor, waters, ligand, and all scoring forces.
         Returns: (system, combined_mol_sys, ligand_start_idx, ligand_num_atoms)
 
-        fast_search=True swaps the six-way decomposed nonbonded force for one
-        combined CustomNonbondedForce with identical physics (see
-        scoring.create_combined_search_force). Six separate forces means six
-        separate neighbor-list rebuilds against the full receptor per
-        setPositions() call -- irrelevant for one-off scoring, but decisive for
-        an inner search loop (GA/MC) evaluating thousands of large-jump
-        candidate poses. Use fast_search=True only for search-loop fitness
-        ranking; use the default (real decomposed terms) for anything whose
-        score is actually reported.
+        fast_search selects among three nonbonded backends:
+        - False (default): six-way decomposed CustomNonbondedForces (real
+          per-term SCORE.INTER.* energies) -- use for anything whose score is
+          actually reported.
+        - True or "pairwise": one combined CustomNonbondedForce with
+          identical physics (scoring.create_combined_search_force). Six
+          separate forces means six separate neighbor-list rebuilds against
+          the full receptor per setPositions() call -- irrelevant for one-off
+          scoring, but decisive for an inner search loop evaluating thousands
+          of large-jump candidate poses.
+        - "grid": AutoDock-style precomputed-grid nonbonded force
+          (scoring.create_grid_search_force) -- turns the O(N_ligand x
+          N_receptor) pairwise sum into O(N_ligand) grid interpolation
+          lookups, at the cost of a one-time (cached on this DockingEngine
+          instance, see _ensure_grid_cache) grid-computation pass. Falls
+          back to "pairwise" transparently if the ligand contains an element
+          outside gridding.STANDARD_VDW_ELEMENTS.
+
+        Use "grid" or "pairwise" only for search-loop fitness ranking; use
+        the default (real decomposed terms) for anything whose score is
+        actually reported.
         """
         lig_sys = SDFParser.mol_to_system(ligand_mol)
         system = mm.System()
@@ -520,12 +593,16 @@ class DockingEngine:
             system.addParticle(m * unit.dalton)
 
         # 2. Nonbonded Forces (separate VDW / POLAR / REPUL / HYD terms for real score decomposition,
-        #    or one combined force for fast search-loop ranking -- see fast_search docstring above)
-        nb_force = (
-            create_combined_search_force(self.weights)
-            if fast_search
-            else create_rdock_nonbonded_forces(self.weights)
-        )
+        #    or one combined/grid force for fast search-loop ranking -- see fast_search docstring above)
+        nb_force = None
+        if fast_search == "grid":
+            nb_force = self._get_grid_search_forces(lig_sys)
+        if nb_force is None:
+            nb_force = (
+                create_combined_search_force(self.weights)
+                if fast_search
+                else create_rdock_nonbonded_forces(self.weights)
+            )
         all_atoms = list(self.receptor.atoms) + (list(self.waters.atoms) if self.waters else []) + list(lig_sys.atoms)
 
         for i, a in enumerate(all_atoms):
@@ -963,6 +1040,7 @@ class DockingEngine:
         torsion_sigma: float = 35.0,
         lamarck_interval: int = 25,
         lamarck_iterations: int = 15,
+        minimize_clash_ceiling_kj: float = 2000.0,
         seed: int = 42,
     ) -> List[DockingResult]:
         """
@@ -990,6 +1068,16 @@ class DockingEngine:
         chromosome is locally minimized and re-encoded (encode_chromosome),
         so within-run local optimization actually compounds instead of being
         immediately perturbed away by the next proposal.
+
+        `minimize_clash_ceiling_kj`: same guard, same reason, as
+        dock_genetic_algorithm's parameter of the same name (see its
+        docstring for the measured grid energy-vs-gradient accuracy gap this
+        protects against) -- lamark()'s periodic minimize() only runs when the
+        chromosome's current raw grid energy is already below this ceiling;
+        the Metropolis proposal loop itself never minimizes (energy_of() is a
+        pure energy read, no gradient), so it was never exposed to this
+        failure mode, but the periodic Lamarckian step is exactly as exposed
+        as dock_genetic_algorithm's per-generation one and gets the same fix.
         """
         rng = np.random.default_rng(seed)
 
@@ -1020,12 +1108,13 @@ class DockingEngine:
         # defined pocket").
         guided = bool(self.pharma_points or tether_constraints or covalent_restraint is not None)
 
-        # Two systems: a cheap single-force system for the O(runs x anneal_steps x
-        # steps_per_temp) inner search loop, and the real decomposed-score system
-        # used only once per run (for the winning pose) so reported SCORE.INTER.*
-        # fields stay genuine.
+        # Two systems: a cheap grid-scored system for the O(runs x anneal_steps x
+        # steps_per_temp) inner search loop (falls back to pairwise if the
+        # ligand has a non-standard element -- see _build_system), and the real
+        # decomposed-score system used only once per run (for the winning pose)
+        # so reported SCORE.INTER.* fields stay genuine.
         search_system, _, lig_start, lig_n = self._build_system(
-            ligand_mol, tether_constraints, covalent_restraint, fast_search=True
+            ligand_mol, tether_constraints, covalent_restraint, fast_search="grid"
         )
         search_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
@@ -1057,6 +1146,10 @@ class DockingEngine:
         def lamarck(chrom: np.ndarray) -> Tuple[float, np.ndarray]:
             coords = decode(chrom)
             context.setPositions(self._full_positions_from_coords(coords))
+            raw_energy = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+            if raw_energy > minimize_clash_ceiling_kj:
+                return raw_energy, chrom
+
             mm.LocalEnergyMinimizer.minimize(
                 context,
                 tolerance=1.0 * (unit.kilojoules_per_mole / unit.nanometer),
@@ -1316,6 +1409,7 @@ class DockingEngine:
         elite_fraction: float = 0.15,
         tournament_size: int = 3,
         fitness_minimize_iterations: int = 10,
+        minimize_clash_ceiling_kj: float = 2000.0,
         n_runs: int = 5,
         seed: int = 42,
     ) -> List[DockingResult]:
@@ -1347,6 +1441,39 @@ class DockingEngine:
         still benefits from smoothing out torsion-induced steric noise. The
         fittest individual of each run gets a full final minimization and is
         returned with genuinely decomposed SCORE.INTER.* fields.
+
+        `minimize_clash_ceiling_kj` guards the grid-scored search system
+        (fast_search="grid", see _build_system) against a real, measured
+        failure mode: OpenMM's Continuous3DFunction grid reproduces *energy*
+        values quite accurately even for a badly clashing pose (measured 4.75%
+        relative error on a real severely-clashed test pose, +47,284 kJ/mol
+        exact vs +49,531 kJ/mol grid), but its *gradient* is far less
+        trustworthy in the steep soft-core-4-8 VDW repulsive wall -- mean
+        per-atom force error was ~36,500 kJ/mol/nm at that same pose (vs. 0-370
+        for every other scoring term at the same pose), because a small
+        interpolation error at a steep point translates into a large slope
+        error. Widening the VDW smoothing window (gridding._smoothed_vdw_curve)
+        does not fix this -- it was swept from 0.008nm up to 0.75nm and only
+        made the *energy* error worse (4.75% to >100%), so the fix is not
+        another smoothing recalibration. Since mutate_chromosome's proposals
+        are large, unconstrained jumps (unlike AutoDock/Vina's own small local
+        moves), a freshly mutated individual is often still in a severe clash
+        -- exactly the regime where LocalEnergyMinimizer.minimize(), which
+        follows the grid's gradient, would get misled before the pose ever
+        reaches a region the grid can be trusted in (empirically this once
+        left a GA run 4.1A from the crystal pose it should have refined onto,
+        vs 0.024A under exact pairwise scoring). The fix: evaluate() checks
+        each candidate's *raw* (unminimized) grid energy first -- accurate per
+        the 4.75% figure above -- and only runs the gradient-following
+        minimization step when that raw energy is already below this ceiling,
+        i.e. only on candidates in the region the grid's forces can be
+        trusted. Candidates still above the ceiling are ranked by their raw
+        grid energy instead (correctly deprioritized without ever asking the
+        grid for an unreliable gradient). 2000 kJ/mol is a pragmatic
+        heuristic -- comfortably below the ~47,000 kJ/mol scale of the severe
+        clash actually measured, comfortably above typical bound-pose energies
+        (tens to a few hundred kJ/mol) -- not a value derived from a precise
+        force-vs-energy error curve.
         """
         rng = np.random.default_rng(seed)
 
@@ -1372,10 +1499,11 @@ class DockingEngine:
         input_centroid_offset = base_coords.mean(axis=0) - self.cavity.center
         base_chrom = np.concatenate([input_centroid_offset, [0.0, 0.0, 0.0], input_torsions])
 
-        # Two systems: a cheap single-force system for the O(pop x gens x runs) inner
-        # search loop, and the real decomposed-score system used only once per run
-        # (for the winning individual) so reported SCORE.INTER.* fields stay genuine.
-        search_system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint, fast_search=True)
+        # Two systems: a cheap grid-scored system for the O(pop x gens x runs) inner
+        # search loop (falls back to pairwise for non-standard elements -- see
+        # _build_system), and the real decomposed-score system used only once per
+        # run (for the winning individual) so reported SCORE.INTER.* fields stay genuine.
+        search_system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, covalent_restraint, fast_search="grid")
         search_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
             mm.Context(search_system, search_integrator, self.platform)
@@ -1405,10 +1533,21 @@ class DockingEngine:
             discarded the moment fitness is scored (the previous Baldwinian
             behavior -- minimize to *score* the individual, but keep evolving
             the original, un-improved genotype).
+
+            Always reads the raw (unminimized) grid energy first and only runs
+            LocalEnergyMinimizer when it's below minimize_clash_ceiling_kj --
+            see that parameter's docstring above for why: the grid's gradient
+            is unreliable precisely on the badly-clashing poses a fresh large
+            mutation often produces, even though its raw energy value is
+            accurate there, so a still-clashing candidate is ranked on that
+            accurate raw energy instead of being minimized with an untrustworthy
+            gradient.
             """
             coords = decode(chrom)
             context.setPositions(self._full_positions_from_coords(coords))
-            if fitness_minimize_iterations > 0:
+            raw_energy = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+
+            if fitness_minimize_iterations > 0 and raw_energy <= minimize_clash_ceiling_kj:
                 mm.LocalEnergyMinimizer.minimize(
                     context,
                     tolerance=1.0 * (unit.kilojoules_per_mole / unit.nanometer),
@@ -1420,8 +1559,7 @@ class DockingEngine:
                 lig_coords = np.array(minimized_coords[lig_start:lig_start + lig_n])
                 new_chrom = encode_chromosome(lig_coords, base_local, torsion_dofs, self.cavity.center)
                 return energy, new_chrom
-            energy = context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-            return energy, chrom
+            return raw_energy, chrom
 
         results: List[DockingResult] = []
         try:
