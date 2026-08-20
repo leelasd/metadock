@@ -262,27 +262,28 @@ class DockingEngine:
         angle_force = mm.HarmonicAngleForce()
         torsion_force = mm.PeriodicTorsionForce()
 
+        # Helper to ensure unique harmonic bond springs
+        added_bonds = set()
+
+        def add_unique_bond(a1_idx: int, a2_idx: int, k_val: float = 500000.0) -> None:
+            pair = (min(a1_idx, a2_idx), max(a1_idx, a2_idx))
+            if pair not in added_bonds:
+                added_bonds.add(pair)
+                p1 = np.array(conf.GetAtomPosition(pair[0] - lig_start))
+                p2 = np.array(conf.GetAtomPosition(pair[1] - lig_start))
+                r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
+                bond_force.addBond(pair[0], pair[1], r0_nm, k_val)
+
         # 1. Harmonic Bonds (k = 500,000 kJ/(mol*nm^2))
         for b in ligand_mol.GetBonds():
-            a1 = b.GetBeginAtomIdx() + lig_start
-            a2 = b.GetEndAtomIdx() + lig_start
-            p1 = np.array(conf.GetAtomPosition(b.GetBeginAtomIdx()))
-            p2 = np.array(conf.GetAtomPosition(b.GetEndAtomIdx()))
-            r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
-            bond_force.addBond(a1, a2, r0_nm, 500000.0)
+            add_unique_bond(b.GetBeginAtomIdx() + lig_start, b.GetEndAtomIdx() + lig_start)
 
-        # 2. Complete Ring Triangulation: rigidly locks all aromatic and non-aromatic sugar/aliphatic rings in 3D
+        # 2. Complete Fused/Individual Ring Triangulation
         for f in fused_systems:
             f_list = sorted(list(f))
-            # Lock all pairwise internal distances in every ring system
             for i in range(len(f_list)):
                 for j in range(i + 1, len(f_list)):
-                    a1 = f_list[i] + lig_start
-                    a2 = f_list[j] + lig_start
-                    p1 = np.array(conf.GetAtomPosition(f_list[i]))
-                    p2 = np.array(conf.GetAtomPosition(f_list[j]))
-                    r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
-                    bond_force.addBond(a1, a2, r0_nm, 500000.0)
+                    add_unique_bond(f_list[i] + lig_start, f_list[j] + lig_start)
 
             # Lock orientation of all substituents directly attached to the ring
             for a in f_list:
@@ -291,27 +292,30 @@ class DockingEngine:
                     nbr_idx = nbr.GetIdx()
                     if nbr_idx not in f:
                         for rn in ring_nbrs:
-                            a1 = nbr_idx + lig_start
-                            a2 = rn + lig_start
-                            p1 = np.array(conf.GetAtomPosition(nbr_idx))
-                            p2 = np.array(conf.GetAtomPosition(rn))
-                            r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
-                            bond_force.addBond(a1, a2, r0_nm, 500000.0)
+                            add_unique_bond(nbr_idx + lig_start, rn + lig_start)
 
-        # 3. Tetrahedral Stereocenter Triangulation: locks all chiral sp3 centers rigid against inversion
+        # 3. Proper Ring Perimeter Torsions for every ring (ensures exact ring planarity)
+        for ring in ligand_mol.GetRingInfo().AtomRings():
+            r_list = list(ring)
+            N = len(r_list)
+            for i in range(N):
+                a1 = r_list[i] + lig_start
+                a2 = r_list[(i + 1) % N] + lig_start
+                a3 = r_list[(i + 2) % N] + lig_start
+                a4 = r_list[(i + 3) % N] + lig_start
+                phi0_rad = float(rdMolTransforms.GetDihedralRad(conf, r_list[i], r_list[(i + 1) % N], r_list[(i + 2) % N], r_list[(i + 3) % N]))
+                phase = 2.0 * phi0_rad - math.pi
+                torsion_force.addTorsion(a1, a2, a3, a4, 2, phase, 2000.0)
+
+        # 4. Tetrahedral Stereocenter Triangulation: locks all chiral sp3 centers rigid against inversion
         for atom in ligand_mol.GetAtoms():
             nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
             if len(nbrs) == 4:  # Tetrahedral sp3 atom
                 for i in range(len(nbrs)):
                     for j in range(i + 1, len(nbrs)):
-                        a1 = nbrs[i] + lig_start
-                        a2 = nbrs[j] + lig_start
-                        p1 = np.array(conf.GetAtomPosition(nbrs[i]))
-                        p2 = np.array(conf.GetAtomPosition(nbrs[j]))
-                        r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
-                        bond_force.addBond(a1, a2, r0_nm, 500000.0)
+                        add_unique_bond(nbrs[i] + lig_start, nbrs[j] + lig_start)
 
-        # 4. Harmonic Angles for all angle triplets (k = 2000 kJ/(mol*rad^2))
+        # 5. Harmonic Angles for all angle triplets (k = 2000 kJ/(mol*rad^2))
         for atom in ligand_mol.GetAtoms():
             c_idx = atom.GetIdx()
             neighbors = [nbr.GetIdx() for nbr in atom.GetNeighbors()]
@@ -327,7 +331,8 @@ class DockingEngine:
                         theta0_rad,
                         2000.0,
                     )
-        # 5. OpenFF / MMFF-style Improper Torsions for all trivalent sp2 and aromatic centers
+
+        # 6. OpenFF / MMFF-style Improper Torsions for all trivalent sp2 and aromatic centers
         for atom in ligand_mol.GetAtoms():
             nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
             if len(nbrs) == 3 and (atom.GetIsAromatic() or atom.GetHybridization() == Chem.HybridizationType.SP2):
@@ -340,22 +345,16 @@ class DockingEngine:
                     2, phase, 2000.0
                 )
 
-        # 6. Exocyclic Halogen & Terminal Substituent Planarity Locks (e.g. F-benzene, Cl-benzene)
+        # 7. Exocyclic Halogen & Terminal Substituent Planarity Locks (e.g. F-benzene, Cl-benzene)
         for atom in ligand_mol.GetAtoms():
             if atom.GetSymbol() in ["F", "CL", "BR", "I", "O", "N", "Cl", "Br"]:
                 nbrs = atom.GetNeighbors()
                 if len(nbrs) == 1 and nbrs[0].GetIsAromatic():
-                    c_idx = nbrs[0].GetIdx()
                     c_nbrs = [n.GetIdx() for n in nbrs[0].GetNeighbors() if n.GetIdx() != atom.GetIdx()]
                     for cn in c_nbrs:
-                        a1 = atom.GetIdx() + lig_start
-                        a2 = cn + lig_start
-                        p1 = np.array(conf.GetAtomPosition(atom.GetIdx()))
-                        p2 = np.array(conf.GetAtomPosition(cn))
-                        r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
-                        bond_force.addBond(a1, a2, r0_nm, 500000.0)
+                        add_unique_bond(atom.GetIdx() + lig_start, cn + lig_start)
 
-        # 7. Flexible Rotatable Single Bonds (allows smooth torsional search during annealing)
+        # 8. Flexible Rotatable Single Bonds (allows smooth torsional search during annealing)
         for b in ligand_mol.GetBonds():
             if not b.IsInRing() and b.GetBondTypeAsDouble() == 1.0:
                 a2 = b.GetBeginAtomIdx()

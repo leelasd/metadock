@@ -108,25 +108,45 @@ def create_pharmacophore_restraint_forces(
     k_pharma: float = 2000.0,  # kJ/(mol * nm^2)
 ) -> List[mm.Force]:
     """
-    Creates OpenMM restraint force applying flat-bottom penalties for pharmacophore points.
-    Uses per-particle parameters to prevent global parameter naming conflicts.
+    Creates OpenMM restraint forces applying flat-bottom penalties for pharmacophore points.
+    - Uses CustomCentroidBondForce for multi-atom features (Aromatic rings) to translate the
+      ring center-of-mass without creating radial inward squeezing forces on individual ring atoms.
+    - Uses CustomExternalForce for single-atom features (Acceptors, Donors, Hydrophobic).
     """
     features = find_ligand_pharma_features(ligand_mol)
     conf = ligand_mol.GetConformer()
+    forces: List[mm.Force] = []
 
-    expr = (
-        "0.5 * k_pharma * weight_scale * step(r_dist - tol) * (r_dist - tol)^2;"
+    # 1. Centroid Force for Multi-Atom Ring Features (Aro)
+    expr_centroid = (
+        "0.5 * k_pharma * step(dist - tol) * (dist - tol)^2;"
+        "dist = sqrt((x1 - x0)^2 + (y1 - y0)^2 + (z1 - z0)^2)"
+    )
+    centroid_force = mm.CustomCentroidBondForce(1, expr_centroid)
+    centroid_force.addPerBondParameter("x0")
+    centroid_force.addPerBondParameter("y0")
+    centroid_force.addPerBondParameter("z0")
+    centroid_force.addPerBondParameter("tol")
+    centroid_force.addGlobalParameter("k_pharma", k_pharma)
+    centroid_force.setForceGroup(GROUP_PHARMA)
+    centroid_force.setName("PharmacophoreCentroidForce")
+
+    # 2. External Force for Single-Atom Features (Acc, Don, Hyd)
+    expr_ext = (
+        "0.5 * k_pharma * step(r_dist - tol) * (r_dist - tol)^2;"
         "r_dist = sqrt((x - x0)^2 + (y - y0)^2 + (z - z0)^2)"
     )
-    force = mm.CustomExternalForce(expr)
-    force.addPerParticleParameter("x0")
-    force.addPerParticleParameter("y0")
-    force.addPerParticleParameter("z0")
-    force.addPerParticleParameter("tol")
-    force.addPerParticleParameter("weight_scale")
-    force.addGlobalParameter("k_pharma", k_pharma)
-    force.setForceGroup(GROUP_PHARMA)
-    force.setName("PharmacophoreRestraintForce")
+    ext_force = mm.CustomExternalForce(expr_ext)
+    ext_force.addPerParticleParameter("x0")
+    ext_force.addPerParticleParameter("y0")
+    ext_force.addPerParticleParameter("z0")
+    ext_force.addPerParticleParameter("tol")
+    ext_force.addGlobalParameter("k_pharma", k_pharma)
+    ext_force.setForceGroup(GROUP_PHARMA)
+    ext_force.setName("PharmacophoreExternalForce")
+
+    has_centroid = False
+    has_ext = False
 
     for point in pharma_points:
         matching_feats = features.get(point.ptype, [])
@@ -156,13 +176,25 @@ def create_pharmacophore_restraint_forces(
         y0_nm = point.y * 0.1
         z0_nm = point.z * 0.1
         tol_nm = point.tolerance * 0.1
-        weight = 1.0 / float(len(best_feat))
 
-        for atom_idx in best_feat:
-            sys_idx = atom_idx + ligand_offset_in_system
-            force.addParticle(sys_idx, [x0_nm, y0_nm, z0_nm, tol_nm, weight])
+        if len(best_feat) > 1:
+            # Multi-atom ring centroid restraint
+            sys_indices = [a + ligand_offset_in_system for a in best_feat]
+            g_idx = centroid_force.addGroup(sys_indices)
+            centroid_force.addBond([g_idx], [x0_nm, y0_nm, z0_nm, tol_nm])
+            has_centroid = True
+        else:
+            # Single-atom restraint
+            sys_idx = best_feat[0] + ligand_offset_in_system
+            ext_force.addParticle(sys_idx, [x0_nm, y0_nm, z0_nm, tol_nm])
+            has_ext = True
 
-    return [force]
+    if has_centroid:
+        forces.append(centroid_force)
+    if has_ext:
+        forces.append(ext_force)
+
+    return forces
 
 
 def align_ligand_to_pharmacophore(mol: Chem.Mol, pharma_points: List[PharmaPoint]) -> Chem.Mol:
