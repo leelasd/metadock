@@ -14,6 +14,7 @@ import openmm as mm
 from openmm import unit
 from rdkit import Chem
 from rdkit.Chem import rdMolTransforms, rdMolDescriptors
+from scipy.spatial.transform import Rotation as ScipyRotation
 
 from .core import MolecularSystem, DockAtom, Mol2Parser, SDFParser, PDBParser
 from .cavity import CavityDefinition, create_cavity_restraint_force
@@ -53,6 +54,145 @@ class DockingResult:
     scores: Dict[str, float]
     run_idx: int = 0
     trajectory: Optional[List[Chem.Mol]] = None
+
+
+# --- Genetic Algorithm chromosome helpers -----------------------------------
+# rDock's actual default search engine is a population-based Genetic Algorithm
+# over a compact chromosome: 3 rigid-body translation genes + 3 rigid-body
+# rotation genes + one torsion gene per rotatable bond. These free functions
+# implement that chromosome (RDKit supplies the ligand topology/rotatable
+# bonds; OpenMM supplies the receptor physics used to score each individual).
+
+def identify_torsion_dofs(ligand_mol: Chem.Mol) -> List[Dict[str, Any]]:
+    """
+    Finds rotatable single bonds and, for each, the rigid subtree of atoms
+    that moves when the torsion is changed, plus a pair of reference atoms
+    used to measure/set the absolute dihedral angle.
+    """
+    dofs: List[Dict[str, Any]] = []
+    for b in ligand_mol.GetBonds():
+        if b.IsInRing() or b.GetBondTypeAsDouble() != 1.0:
+            continue
+        a1_idx, a2_idx = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+        a1_atom, a2_atom = ligand_mol.GetAtomWithIdx(a1_idx), ligand_mol.GetAtomWithIdx(a2_idx)
+        if a1_atom.GetDegree() < 2 or a2_atom.GetDegree() < 2:
+            continue
+
+        # BFS subtree of atoms on the a2 side of the bond (a2 inclusive, a1 excluded)
+        visited = {a1_idx}
+        queue = [a2_idx]
+        subtree: List[int] = []
+        while queue:
+            curr = queue.pop(0)
+            if curr in visited:
+                continue
+            visited.add(curr)
+            subtree.append(curr)
+            for nbr in ligand_mol.GetAtomWithIdx(curr).GetNeighbors():
+                if nbr.GetIdx() not in visited:
+                    queue.append(nbr.GetIdx())
+
+        ref0 = next((n.GetIdx() for n in a1_atom.GetNeighbors() if n.GetIdx() != a2_idx), None)
+        ref3 = next((n.GetIdx() for n in a2_atom.GetNeighbors() if n.GetIdx() != a1_idx), None)
+        if ref0 is None or ref3 is None:
+            continue
+
+        dofs.append({"a1": a1_idx, "a2": a2_idx, "subtree": subtree, "ref0": ref0, "ref3": ref3})
+    return dofs
+
+
+def _dihedral_deg(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+    b0 = p0 - p1
+    b1 = p2 - p1
+    b2 = p3 - p2
+    b1n = b1 / (np.linalg.norm(b1) + 1e-12)
+    v = b0 - np.dot(b0, b1n) * b1n
+    w = b2 - np.dot(b2, b1n) * b1n
+    x = np.dot(v, w)
+    y = np.dot(np.cross(b1n, v), w)
+    return float(np.degrees(np.arctan2(y, x)))
+
+
+def decode_chromosome(
+    chromosome: np.ndarray,
+    base_local_coords: np.ndarray,
+    torsion_dofs: List[Dict[str, Any]],
+    cavity_center: np.ndarray,
+) -> np.ndarray:
+    """
+    Decodes a chromosome into absolute Cartesian ligand coordinates (Angstroms):
+    first sets each rotatable-bond torsion to its absolute gene value (internal
+    DOFs), then places the resulting rigid conformation via the 6 rigid-body
+    genes relative to the cavity center (external DOFs).
+    """
+    coords = base_local_coords.copy()
+    n_t = len(torsion_dofs)
+    trans = chromosome[0:3]
+    euler = chromosome[3:6]
+    torsions = chromosome[6:6 + n_t]
+
+    for dof, target_angle in zip(torsion_dofs, torsions):
+        p1, p2 = coords[dof["a1"]], coords[dof["a2"]]
+        axis = p2 - p1
+        norm = np.linalg.norm(axis)
+        if norm < 1e-6:
+            continue
+        axis = axis / norm
+        current = _dihedral_deg(coords[dof["ref0"]], p1, p2, coords[dof["ref3"]])
+        delta = float(target_angle) - current
+        rot = ScipyRotation.from_rotvec(np.radians(delta) * axis)
+        idx = dof["subtree"]
+        coords[idx] = p1 + rot.apply(coords[idx] - p1)
+
+    centroid = coords.mean(axis=0)
+    centered = coords - centroid
+    rot_mat = ScipyRotation.from_euler("xyz", euler, degrees=True).as_matrix()
+    return cavity_center + trans + centered.dot(rot_mat.T)
+
+
+def random_chromosome(rng: np.random.Generator, trans_range: float, n_torsions: int) -> np.ndarray:
+    return np.concatenate([
+        rng.uniform(-trans_range, trans_range, size=3),
+        rng.uniform(-180.0, 180.0, size=3),
+        rng.uniform(-180.0, 180.0, size=n_torsions),
+    ])
+
+
+def tournament_select(
+    rng: np.random.Generator, population: List[np.ndarray], scores: List[float], k: int
+) -> np.ndarray:
+    idxs = rng.integers(0, len(population), size=k)
+    best = idxs[0]
+    for i in idxs[1:]:
+        if scores[i] < scores[best]:
+            best = i
+    return population[best]
+
+
+def crossover_chromosomes(rng: np.random.Generator, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    mask = rng.random(p1.shape[0]) < 0.5
+    return np.where(mask, p1, p2)
+
+
+def mutate_chromosome(
+    rng: np.random.Generator,
+    chromosome: np.ndarray,
+    mutation_rate: float,
+    n_torsions: int,
+    trans_sigma: float = 0.5,
+    rot_sigma: float = 20.0,
+    torsion_sigma: float = 30.0,
+) -> np.ndarray:
+    child = chromosome.copy()
+    n_genes = child.shape[0]
+    mut_mask = rng.random(n_genes) < mutation_rate
+    noise = np.zeros(n_genes)
+    noise[0:3] = rng.normal(0.0, trans_sigma, size=3)
+    noise[3:6] = rng.normal(0.0, rot_sigma, size=3)
+    if n_torsions > 0:
+        noise[6:6 + n_torsions] = rng.normal(0.0, torsion_sigma, size=n_torsions)
+    child[mut_mask] += noise[mut_mask]
+    return child
 
 
 class DockingEngine:
@@ -440,6 +580,14 @@ class DockingEngine:
         wat_coords = self.waters.coordinates if self.waters else np.zeros((0, 3))
         
         all_coords = np.vstack([rec_coords, wat_coords, lig_coords]) * 0.1  # Å -> nm
+        return all_coords * unit.nanometers
+
+    def _full_positions_from_coords(self, lig_coords_angstrom: np.ndarray) -> unit.Quantity:
+        """Like _get_system_positions, but takes raw ligand coordinates (Å) directly, avoiding
+        the cost of building an RDKit conformer for every candidate pose in a GA population."""
+        rec_coords = self.receptor.coordinates
+        wat_coords = self.waters.coordinates if self.waters else np.zeros((0, 3))
+        all_coords = np.vstack([rec_coords, wat_coords, lig_coords_angstrom]) * 0.1
         return all_coords * unit.nanometers
 
     def _update_ligand_conformer(
@@ -844,3 +992,149 @@ class DockingEngine:
             )
         finally:
             del context, integrator
+
+    def dock_genetic_algorithm(
+        self,
+        ligand_mol: Chem.Mol,
+        tether_constraints: Optional[List[TetherConstraint]] = None,
+        population_size: int = 40,
+        n_generations: int = 30,
+        mutation_rate: float = 0.2,
+        mutation_trans_sigma: float = 1.0,
+        mutation_rot_sigma: float = 25.0,
+        mutation_torsion_sigma: float = 35.0,
+        elite_fraction: float = 0.15,
+        tournament_size: int = 3,
+        translation_search_radius: Optional[float] = None,
+        fitness_minimize_iterations: int = 25,
+        n_runs: int = 10,
+        seed: int = 42,
+    ) -> List[DockingResult]:
+        """
+        rDock-style Genetic Algorithm docking: this is rDock's own default search
+        engine (population-based GA over rigid-body + torsional DOFs), as opposed
+        to the SAMD / Monte Carlo protocols above, which are OpenMM-native stand-ins.
+
+        Each chromosome is [3 translation genes (Å), 3 rigid-body rotation genes
+        (Euler degrees), 1 torsion gene per rotatable bond (absolute dihedral,
+        degrees)]. RDKit supplies the ligand topology and rotatable-bond
+        identification; OpenMM (via the shared rDock-scoring Context) supplies
+        the fitness function. Each of `n_runs` independent GA populations evolves
+        for `n_generations` generations with tournament selection, uniform
+        crossover, Gaussian mutation, and elitism; the fittest individual of each
+        run is locally minimized and returned.
+
+        Fitness is evaluated Lamarckian/Baldwinian-style: every candidate pose is
+        given a short local minimization (`fitness_minimize_iterations`) before
+        its energy is read back. A raw, unrelaxed soft-core score is dominated by
+        random steric clashes (any random torsion/orientation typically produces
+        energies orders of magnitude worse than the true minimum), which makes
+        the unrelaxed landscape too noisy for selection to act on -- this mirrors
+        why AutoDock's Lamarckian GA and rDock's own GA+simplex hybrid both
+        couple global GA search with local refinement rather than scoring raw
+        poses. `translation_search_radius` bounds the initial/mutated centroid
+        search box; it defaults to a modest fraction of the cavity radius rather
+        than the full cavity radius, since the cavity restraint's radius already
+        has to enclose the whole ligand extent (much bigger than the sensible
+        range for the ligand *centroid* to wander).
+        """
+        rng = np.random.default_rng(seed)
+
+        if self.pharma_points and not tether_constraints:
+            ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
+
+        torsion_dofs = identify_torsion_dofs(ligand_mol)
+        n_t = len(torsion_dofs)
+
+        conf = ligand_mol.GetConformer()
+        base_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
+        base_local = base_coords - base_coords.mean(axis=0)
+
+        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints)
+        integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        context = (
+            mm.Context(system, integrator, self.platform)
+            if self.platform
+            else mm.Context(system, integrator)
+        )
+
+        if translation_search_radius is not None:
+            trans_range = translation_search_radius
+        else:
+            trans_range = max(min(self.cavity.radius, 8.0), 1.0)
+        n_elite = max(1, int(round(elite_fraction * population_size)))
+
+        def decode(chrom: np.ndarray) -> np.ndarray:
+            return decode_chromosome(chrom, base_local, torsion_dofs, self.cavity.center)
+
+        def fitness(chrom: np.ndarray) -> float:
+            coords = decode(chrom)
+            context.setPositions(self._full_positions_from_coords(coords))
+            if fitness_minimize_iterations > 0:
+                mm.LocalEnergyMinimizer.minimize(
+                    context,
+                    tolerance=1.0 * (unit.kilojoules_per_mole / unit.nanometer),
+                    maxIterations=fitness_minimize_iterations,
+                )
+            return context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+
+        results: List[DockingResult] = []
+        try:
+            for run in range(n_runs):
+                population = [random_chromosome(rng, trans_range, n_t) for _ in range(population_size)]
+                scores = [fitness(c) for c in population]
+
+                for gen in range(n_generations):
+                    order = np.argsort(scores)
+                    new_population = [population[i].copy() for i in order[:n_elite]]
+
+                    while len(new_population) < population_size:
+                        p1 = tournament_select(rng, population, scores, tournament_size)
+                        p2 = tournament_select(rng, population, scores, tournament_size)
+                        child = crossover_chromosomes(rng, p1, p2)
+                        child = mutate_chromosome(
+                            rng, child, mutation_rate, n_t,
+                            trans_sigma=mutation_trans_sigma,
+                            rot_sigma=mutation_rot_sigma,
+                            torsion_sigma=mutation_torsion_sigma,
+                        )
+                        new_population.append(child)
+
+                    population = new_population
+                    scores = [fitness(c) for c in population]
+
+                best_idx = int(np.argmin(scores))
+                best_chrom = population[best_idx]
+                best_coords = decode(best_chrom)
+
+                mol_variant = copy.deepcopy(ligand_mol)
+                vconf = mol_variant.GetConformer()
+                for i in range(lig_n):
+                    vconf.SetAtomPosition(i, (float(best_coords[i, 0]), float(best_coords[i, 1]), float(best_coords[i, 2])))
+
+                context.setPositions(self._full_positions_from_coords(best_coords))
+                mm.LocalEnergyMinimizer.minimize(
+                    context,
+                    tolerance=0.1 * (unit.kilojoules_per_mole / unit.nanometer),
+                    maxIterations=500,
+                )
+                state = context.getState(getPositions=True, getEnergy=True)
+                final_scores = self._extract_decomposed_scores(context, mol_variant)
+                final_mol = self._update_ligand_conformer(mol_variant, state.getPositions(), lig_start, lig_n)
+
+                for k, v in final_scores.items():
+                    final_mol.SetProp(k, f"{v:.4f}")
+
+                results.append(
+                    DockingResult(
+                        mol=final_mol,
+                        score=final_scores["SCORE"],
+                        scores=final_scores,
+                        run_idx=run + 1,
+                    )
+                )
+        finally:
+            del context, integrator
+
+        results.sort(key=lambda r: r.score)
+        return results

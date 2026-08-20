@@ -15,6 +15,7 @@ from .cavity import CavityDefinition
 from .engine import DockingEngine
 from .tether import find_tethered_atoms_mcs
 from .protonation import protonate_ligand_ph
+from .clustering import cluster_docked_poses
 
 
 def parse_prm_receptor_and_cavity(prm_file: Path) -> Tuple[Path, CavityDefinition]:
@@ -80,10 +81,30 @@ def main():
     mc_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
     mc_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
+    # Command: ga (Genetic Algorithm -- rDock's own default search engine)
+    ga_p = subparsers.add_parser("ga", help="Dock ligands using rDock's default Genetic Algorithm search over rigid-body + torsional DOFs")
+    ga_p.add_argument("-r", "--prm", required=True, help="Path to cavity.prm parameter file")
+    ga_p.add_argument("-i", "--input", required=True, help="Input SDF / SD ligand file")
+    ga_p.add_argument("-o", "--output", required=True, help="Output SDF file for docked poses")
+    ga_p.add_argument("-n", "--runs", type=int, default=10, help="Number of independent GA runs / output poses (default: 10)")
+    ga_p.add_argument("--pop-size", type=int, default=30, help="GA population size per run (default: 30)")
+    ga_p.add_argument("--generations", type=int, default=60, help="Number of GA generations per run (default: 60)")
+    ga_p.add_argument("--mutation-rate", type=float, default=0.15, help="Per-gene mutation probability (default: 0.15)")
+    ga_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
+    ga_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
+    ga_p.add_argument("--flex-radius", type=float, default=None, help="Radius (Å) around cavity center to treat receptor side chains as flexible")
+    ga_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
+
     # Command: stats
     stats_p = subparsers.add_parser("stats", help="Compute docking statistics (heavy-atom RMSD, valence bond & angle deviations) vs crystal reference")
     stats_p.add_argument("-ref", "--reference", required=True, help="Reference co-crystal ligand SDF / SD file")
     stats_p.add_argument("-i", "--input", required=True, help="Docked poses SDF / SD file to evaluate")
+
+    # Command: cluster
+    cluster_p = subparsers.add_parser("cluster", help="Cluster docked poses using heavy-atom RMSD (Butina) to remove redundant poses")
+    cluster_p.add_argument("-i", "--input", required=True, help="Input docked poses SDF / SD file")
+    cluster_p.add_argument("-o", "--output", required=True, help="Output filtered SDF file with unique cluster leaders")
+    cluster_p.add_argument("--cutoff", type=float, default=1.5, help="Heavy-atom RMSD clustering cutoff in Å (default: 1.5)")
 
     args = parser.parse_args()
     if not args.command:
@@ -145,6 +166,23 @@ def main():
             max_a = max(angle_diffs) if angle_diffs else 0.0
 
             print(f"#{idx+1:<7} | {score_str:<18} | {rmsd_str:<16} | {max_b:<18.4f} | {max_a:<18.2f} | {status}")
+        return
+
+    if args.command == "cluster":
+        in_path = Path(args.input)
+        out_path = Path(args.output)
+        if not out_path.name.endswith(".sdf") and not out_path.name.endswith(".sd"):
+            out_path = out_path.with_suffix(".sdf")
+        mols = SDFParser.load_molecules(in_path)
+        if not mols:
+            sys.exit(f"Error: could not load poses from {in_path}")
+        print(f"[*] Loaded {len(mols)} pose(s) from {in_path}. Clustering at RMSD cutoff = {args.cutoff:.2f} Å...")
+        clustered = cluster_docked_poses(mols, rmsd_cutoff=args.cutoff)
+        writer = Chem.SDWriter(str(out_path))
+        for m in clustered:
+            writer.write(m)
+        writer.close()
+        print(f"[✓] Extracted {len(clustered)} distinct binding cluster representative(s) (written to {out_path})")
         return
 
     prm_path = Path(args.prm)
@@ -246,6 +284,32 @@ def main():
                     traj_writer.write(frame)
                 traj_writer.close()
                 print(f"[✓] Complete {len(res.trajectory)}-frame Monte Carlo trajectory written to {traj_path}")
+
+    elif args.command == "ga":
+        pharma = getattr(args, "pharma", None)
+        engine = DockingEngine(
+            receptor_path=rec_path,
+            cavity=cavity,
+            pharma_restr_path=pharma,
+            waters_pdb_path=getattr(args, "waters", None),
+            flexible_radius=getattr(args, "flex_radius", None),
+        )
+        for lig_idx, lig in enumerate(ligands):
+            print(
+                f"[*] Genetic Algorithm docking on ligand #{lig_idx+1} "
+                f"({args.runs} runs x {args.pop_size} individuals x {args.generations} generations)..."
+            )
+            results = engine.dock_genetic_algorithm(
+                lig,
+                population_size=args.pop_size,
+                n_generations=args.generations,
+                mutation_rate=args.mutation_rate,
+                n_runs=args.runs,
+            )
+            for rank, r in enumerate(results):
+                r.mol.SetProp("DOCK_RANK", str(rank + 1))
+                writer.write(r.mol)
+                print(f"  Rank #{rank+1}: Score = {r.score:.3f} (VDW: {r.scores['SCORE.INTER.VDW']:.2f}, Polar: {r.scores['SCORE.INTER.POLAR']:.2f})")
 
     writer.close()
     print(f"[✓] Results written to {out_path}")
