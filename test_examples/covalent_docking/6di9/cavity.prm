@@ -1,0 +1,17 @@
+RBT_PARAMETER_FILE_V1.00
+TITLE BTK_Covalent_6DI9_Cys481
+
+RECEPTOR_FILE receptor.pdb
+RECEPTOR_FLEX 3.0
+
+##################################################################
+### CAVITY DEFINITION: COVALENT BINDING POCKET
+##################################################################
+SECTION CAVITY
+    SCORING_FUNCTION    RbtCavityGridSF
+    WEIGHT              1.0
+    CENTER              (-22.21, 7.42, 0.91)
+    RADIUS              15.0
+    GRID                0.5
+    QUAD_ALL            TRUE
+END_SECTION
