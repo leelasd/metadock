@@ -327,8 +327,35 @@ class DockingEngine:
                         theta0_rad,
                         2000.0,
                     )
+        # 5. OpenFF / MMFF-style Improper Torsions for all trivalent sp2 and aromatic centers
+        for atom in ligand_mol.GetAtoms():
+            nbrs = [n.GetIdx() for n in atom.GetNeighbors()]
+            if len(nbrs) == 3 and (atom.GetIsAromatic() or atom.GetHybridization() == Chem.HybridizationType.SP2):
+                c = atom.GetIdx()
+                a1, a2, a3 = nbrs[0], nbrs[1], nbrs[2]
+                phi0_rad = float(rdMolTransforms.GetDihedralRad(conf, a1, c, a2, a3))
+                phase = 2.0 * phi0_rad - math.pi
+                torsion_force.addTorsion(
+                    a1 + lig_start, c + lig_start, a2 + lig_start, a3 + lig_start,
+                    2, phase, 2000.0
+                )
 
-        # 5. Flexible Rotatable Single Bonds (allows smooth torsional search during annealing)
+        # 6. Exocyclic Halogen & Terminal Substituent Planarity Locks (e.g. F-benzene, Cl-benzene)
+        for atom in ligand_mol.GetAtoms():
+            if atom.GetSymbol() in ["F", "CL", "BR", "I", "O", "N", "Cl", "Br"]:
+                nbrs = atom.GetNeighbors()
+                if len(nbrs) == 1 and nbrs[0].GetIsAromatic():
+                    c_idx = nbrs[0].GetIdx()
+                    c_nbrs = [n.GetIdx() for n in nbrs[0].GetNeighbors() if n.GetIdx() != atom.GetIdx()]
+                    for cn in c_nbrs:
+                        a1 = atom.GetIdx() + lig_start
+                        a2 = cn + lig_start
+                        p1 = np.array(conf.GetAtomPosition(atom.GetIdx()))
+                        p2 = np.array(conf.GetAtomPosition(cn))
+                        r0_nm = float(np.linalg.norm(p1 - p2) * 0.1)
+                        bond_force.addBond(a1, a2, r0_nm, 500000.0)
+
+        # 7. Flexible Rotatable Single Bonds (allows smooth torsional search during annealing)
         for b in ligand_mol.GetBonds():
             if not b.IsInRing() and b.GetBondTypeAsDouble() == 1.0:
                 a2 = b.GetBeginAtomIdx()
