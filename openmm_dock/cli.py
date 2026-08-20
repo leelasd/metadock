@@ -57,7 +57,15 @@ def main():
     teth_p.add_argument("-ref", "--reference", required=True, help="Reference co-crystal ligand SDF")
     teth_p.add_argument("-i", "--input", required=True, help="Input query ligands SDF")
     teth_p.add_argument("-o", "--output", required=True, help="Output SDF file for tethered docked poses")
-    teth_p.add_argument("-n", "--runs", type=int, default=5, help="Number of docking runs per ligand")
+    # Command: mc (Monte Carlo Basin-Hopping)
+    mc_p = subparsers.add_parser("mc", help="Dock ligands using Metropolis Monte Carlo with Basin-Hopping Minimization")
+    mc_p.add_argument("-r", "--prm", required=True, help="Path to cavity.prm parameter file")
+    mc_p.add_argument("-i", "--input", required=True, help="Input SDF / SD ligand file")
+    mc_p.add_argument("-o", "--output", required=True, help="Output SDF file for docked poses")
+    mc_p.add_argument("-s", "--steps", type=int, default=100, help="Number of Monte Carlo steps (default: 100)")
+    mc_p.add_argument("-t", "--temperature", type=float, default=300.0, help="Monte Carlo simulation temperature in K (default: 300)")
+    mc_p.add_argument("-p", "--pharma", default=None, help="Optional pharmacophore constraint file (pharma.restr)")
+    mc_p.add_argument("-w", "--waters", default=None, help="Optional PDB file with active-site waters")
 
     args = parser.parse_args()
     if not args.command:
@@ -130,6 +138,20 @@ def main():
                 print(f"[*] Ligand #{lig_idx+1}: No significant MCS found. Minimizing freely...")
                 res = engine.minimize(lig)
                 writer.write(res.mol)
+
+    elif args.command == "mc":
+        pharma = getattr(args, "pharma", None)
+        engine = DockingEngine(
+            receptor_path=rec_path,
+            cavity=cavity,
+            pharma_restr_path=pharma,
+            waters_pdb_path=getattr(args, "waters", None),
+        )
+        for lig_idx, lig in enumerate(ligands):
+            print(f"[*] Monte Carlo Basin-Hopping docking on ligand #{lig_idx+1} ({args.steps} steps @ {args.temperature}K)...")
+            res = engine.dock_monte_carlo(lig, n_steps=args.steps, temperature_k=args.temperature)
+            writer.write(res.mol)
+            print(f"  Best Pose: Score = {res.score:.3f} (VDW: {res.scores['SCORE.INTER.VDW']:.2f}, Polar: {res.scores['SCORE.INTER.POLAR']:.2f})")
 
     writer.close()
     print(f"[✓] Results written to {out_path}")

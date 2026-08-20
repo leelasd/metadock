@@ -587,3 +587,140 @@ class DockingEngine:
 
         results.sort(key=lambda r: r.score)
         return results
+
+    def dock_monte_carlo(
+        self,
+        ligand_mol: Chem.Mol,
+        tether_constraints: Optional[List[TetherConstraint]] = None,
+        n_steps: int = 100,
+        temperature_k: float = 300.0,
+        translation_scale: float = 0.5,  # Å
+        rotation_scale: float = 15.0,     # degrees
+        torsion_scale: float = 30.0,      # degrees
+        minimize_each_step: bool = True,
+        seed: int = 42,
+    ) -> DockingResult:
+        """
+        Runs Metropolis Monte Carlo with Minimization (MCM / Basin-Hopping) docking.
+        Explores discrete rigid-body translations, rotations, and internal rotatable bond torsions.
+        """
+        random.seed(seed)
+        np.random.seed(seed)
+
+        if self.pharma_points and not tether_constraints:
+            ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
+
+        # 1. Identify rotatable single bonds and their moving subtrees
+        rot_bonds = []
+        for b in ligand_mol.GetBonds():
+            if not b.IsInRing() and b.GetBondType() == Chem.BondType.SINGLE:
+                a1, a2 = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
+                if len(ligand_mol.GetAtomWithIdx(a1).GetNeighbors()) > 1 and len(ligand_mol.GetAtomWithIdx(a2).GetNeighbors()) > 1:
+                    visited = {a1}
+                    q = [a2]
+                    st = set()
+                    while q:
+                        curr = q.pop(0)
+                        if curr not in visited:
+                            visited.add(curr)
+                            st.add(curr)
+                            for nbr in ligand_mol.GetAtomWithIdx(curr).GetNeighbors():
+                                if nbr.GetIdx() not in visited:
+                                    q.append(nbr.GetIdx())
+                    rot_bonds.append((a1, a2, list(st)))
+
+        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints)
+        integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        context = (
+            mm.Context(system, integrator, self.platform)
+            if self.platform
+            else mm.Context(system, integrator)
+        )
+
+        try:
+            curr_mol = copy.deepcopy(ligand_mol)
+            context.setPositions(self._get_system_positions(curr_mol))
+
+            # Initial relaxation
+            mm.LocalEnergyMinimizer.minimize(
+                context,
+                tolerance=0.1 * (unit.kilojoules_per_mole / unit.nanometer),
+                maxIterations=200,
+            )
+            state = context.getState(getPositions=True, getEnergy=True)
+            curr_mol = self._update_ligand_conformer(curr_mol, state.getPositions(), lig_start, lig_n)
+            curr_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) / 4.184
+            curr_coords = np.array([curr_mol.GetConformer().GetAtomPosition(i) for i in range(lig_n)])
+
+            best_mol = copy.deepcopy(curr_mol)
+            best_energy = curr_energy
+            best_scores = self._extract_decomposed_scores(context)
+
+            from scipy.spatial.transform import Rotation as ScipyRotation
+            beta = 1.0 / (0.001987 * temperature_k)
+
+            for step in range(n_steps):
+                trial_coords = np.copy(curr_coords)
+                move_type = np.random.choice(
+                    ["trans", "rot", "torsion"],
+                    p=[0.2, 0.2, 0.6] if rot_bonds else [0.5, 0.5, 0.0],
+                )
+
+                if move_type == "trans":
+                    trial_coords += np.random.uniform(-translation_scale, translation_scale, size=3)
+                elif move_type == "rot":
+                    axis = np.random.normal(size=3)
+                    axis /= (np.linalg.norm(axis) + 1e-12)
+                    angle_rad = math.radians(np.random.uniform(-rotation_scale, rotation_scale))
+                    rot_mat = ScipyRotation.from_rotvec(angle_rad * axis).as_matrix()
+                    c = np.mean(trial_coords, axis=0)
+                    trial_coords = c + np.dot(trial_coords - c, rot_mat.T)
+                elif move_type == "torsion" and rot_bonds:
+                    a1, a2, st = rot_bonds[np.random.randint(len(rot_bonds))]
+                    p1 = trial_coords[a1]
+                    p2 = trial_coords[a2]
+                    v = p2 - p1
+                    v /= (np.linalg.norm(v) + 1e-12)
+                    d_phi = math.radians(np.random.uniform(-torsion_scale, torsion_scale))
+                    rot_mat = ScipyRotation.from_rotvec(d_phi * v).as_matrix()
+                    trial_coords[st] = p1 + np.dot(trial_coords[st] - p1, rot_mat.T)
+
+                trial_mol = copy.deepcopy(curr_mol)
+                conf = trial_mol.GetConformer()
+                for i in range(lig_n):
+                    conf.SetAtomPosition(i, (float(trial_coords[i, 0]), float(trial_coords[i, 1]), float(trial_coords[i, 2])))
+
+                context.setPositions(self._get_system_positions(trial_mol))
+
+                if minimize_each_step:
+                    mm.LocalEnergyMinimizer.minimize(
+                        context,
+                        tolerance=0.5 * (unit.kilojoules_per_mole / unit.nanometer),
+                        maxIterations=50,
+                    )
+
+                state = context.getState(getPositions=True, getEnergy=True)
+                trial_energy = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) / 4.184
+                delta_e = trial_energy - curr_energy
+
+                if delta_e <= 0.0 or random.random() < math.exp(- beta * delta_e):
+                    curr_energy = trial_energy
+                    curr_mol = self._update_ligand_conformer(trial_mol, state.getPositions(), lig_start, lig_n)
+                    curr_coords = np.array([curr_mol.GetConformer().GetAtomPosition(i) for i in range(lig_n)])
+
+                    if curr_energy < best_energy:
+                        best_energy = curr_energy
+                        best_mol = copy.deepcopy(curr_mol)
+                        best_scores = self._extract_decomposed_scores(context)
+
+            for k, v in best_scores.items():
+                best_mol.SetProp(k, f"{v:.4f}")
+
+            return DockingResult(
+                mol=best_mol,
+                score=best_scores["SCORE"],
+                scores=best_scores,
+                run_idx=1,
+            )
+        finally:
+            del context, integrator
