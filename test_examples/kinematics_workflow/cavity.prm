@@ -1,0 +1,17 @@
+RBT_PARAMETER_FILE_V1.00
+TITLE BTK_Covalent_6DI9_Cys481
+
+RECEPTOR_FILE receptor.pdb
+RECEPTOR_FLEX 3.0
+
+##################################################################
+### CAVITY DEFINITION: TRUE BTK ATP-BINDING POCKET
+##################################################################
+SECTION CAVITY
+    SCORING_FUNCTION    RbtCavityGridSF
+    WEIGHT              1.0
+    CENTER              (-12.16, 4.01, 0.43)
+    RADIUS              22.0
+    GRID                0.5
+    QUAD_ALL            TRUE
+END_SECTION
