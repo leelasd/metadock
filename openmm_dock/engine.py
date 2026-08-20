@@ -21,6 +21,7 @@ from .cavity import CavityDefinition, create_cavity_restraint_force
 from .scoring import (
     ScoreWeights,
     create_rdock_nonbonded_forces,
+    create_combined_search_force,
     GROUP_VDW_INTER,
     GROUP_VDW_INTRA,
     GROUP_POLAR_INTER,
@@ -274,10 +275,21 @@ class DockingEngine:
         ligand_mol: Chem.Mol,
         tether_constraints: Optional[List[TetherConstraint]] = None,
         covalent_restraint: Optional[CovalentRestraint] = None,
+        fast_search: bool = False,
     ) -> Tuple[mm.System, MolecularSystem, int, int]:
         """
         Assembles OpenMM System with receptor, waters, ligand, and all scoring forces.
         Returns: (system, combined_mol_sys, ligand_start_idx, ligand_num_atoms)
+
+        fast_search=True swaps the six-way decomposed nonbonded force for one
+        combined CustomNonbondedForce with identical physics (see
+        scoring.create_combined_search_force). Six separate forces means six
+        separate neighbor-list rebuilds against the full receptor per
+        setPositions() call -- irrelevant for one-off scoring, but decisive for
+        an inner search loop (GA/MC) evaluating thousands of large-jump
+        candidate poses. Use fast_search=True only for search-loop fitness
+        ranking; use the default (real decomposed terms) for anything whose
+        score is actually reported.
         """
         lig_sys = SDFParser.mol_to_system(ligand_mol)
         system = mm.System()
@@ -349,8 +361,13 @@ class DockingEngine:
             m = 12.011 if el == "C" else (1.008 if el == "H" else (15.999 if el == "O" else (14.007 if el == "N" else 32.06)))
             system.addParticle(m * unit.dalton)
 
-        # 2. Nonbonded Forces (separate VDW / POLAR / REPUL / HYD terms for real score decomposition)
-        nb_force = create_rdock_nonbonded_forces(self.weights)
+        # 2. Nonbonded Forces (separate VDW / POLAR / REPUL / HYD terms for real score decomposition,
+        #    or one combined force for fast search-loop ranking -- see fast_search docstring above)
+        nb_force = (
+            create_combined_search_force(self.weights)
+            if fast_search
+            else create_rdock_nonbonded_forces(self.weights)
+        )
         all_atoms = list(self.receptor.atoms) + (list(self.waters.atoms) if self.waters else []) + list(lig_sys.atoms)
 
         for i, a in enumerate(all_atoms):
@@ -1096,12 +1113,23 @@ class DockingEngine:
         base_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
         base_local = base_coords - base_coords.mean(axis=0)
 
-        system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints)
-        integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        # Two systems: a cheap single-force system for the O(pop x gens x runs) inner
+        # search loop, and the real decomposed-score system used only once per run
+        # (for the winning individual) so reported SCORE.INTER.* fields stay genuine.
+        search_system, _, lig_start, lig_n = self._build_system(ligand_mol, tether_constraints, fast_search=True)
+        search_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         context = (
-            mm.Context(system, integrator, self.platform)
+            mm.Context(search_system, search_integrator, self.platform)
             if self.platform
-            else mm.Context(system, integrator)
+            else mm.Context(search_system, search_integrator)
+        )
+
+        report_system, _, _, _ = self._build_system(ligand_mol, tether_constraints, fast_search=False)
+        report_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        report_context = (
+            mm.Context(report_system, report_integrator, self.platform)
+            if self.platform
+            else mm.Context(report_system, report_integrator)
         )
 
         if translation_search_radius is not None:
@@ -1158,14 +1186,14 @@ class DockingEngine:
                 for i in range(lig_n):
                     vconf.SetAtomPosition(i, (float(best_coords[i, 0]), float(best_coords[i, 1]), float(best_coords[i, 2])))
 
-                context.setPositions(self._full_positions_from_coords(best_coords))
+                report_context.setPositions(self._full_positions_from_coords(best_coords))
                 mm.LocalEnergyMinimizer.minimize(
-                    context,
+                    report_context,
                     tolerance=0.1 * (unit.kilojoules_per_mole / unit.nanometer),
                     maxIterations=500,
                 )
-                state = context.getState(getPositions=True, getEnergy=True)
-                final_scores = self._extract_decomposed_scores(context, mol_variant)
+                state = report_context.getState(getPositions=True, getEnergy=True)
+                final_scores = self._extract_decomposed_scores(report_context, mol_variant)
                 final_mol = self._update_ligand_conformer(mol_variant, state.getPositions(), lig_start, lig_n)
 
                 for k, v in final_scores.items():
@@ -1180,7 +1208,8 @@ class DockingEngine:
                     )
                 )
         finally:
-            del context, integrator
+            del context, search_integrator
+            del report_context, report_integrator
 
         results.sort(key=lambda r: r.score)
         return results

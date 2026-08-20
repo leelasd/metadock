@@ -220,6 +220,46 @@ class Mol2Parser:
         return MolecularSystem(name=mol_name, atoms=atoms, bonds=bonds)
 
 
+def sanitize_hydrogens_3d(mol: Chem.Mol) -> Chem.Mol:
+    """
+    Checks and repairs 3D hydrogen positions if missing or distorted,
+    optimizing hydrogen positions with all heavy atoms rigidly locked.
+    """
+    needs_repair = False
+    h_atoms = [a for a in mol.GetAtoms() if a.GetAtomicNum() == 1]
+    if len(h_atoms) == 0:
+        needs_repair = True
+    else:
+        conf = mol.GetConformer()
+        for b in mol.GetBonds():
+            a1 = mol.GetAtomWithIdx(b.GetBeginAtomIdx())
+            a2 = mol.GetAtomWithIdx(b.GetEndAtomIdx())
+            if a1.GetAtomicNum() == 1 or a2.GetAtomicNum() == 1:
+                p1 = np.array(conf.GetAtomPosition(b.GetBeginAtomIdx()))
+                p2 = np.array(conf.GetAtomPosition(b.GetEndAtomIdx()))
+                d = np.linalg.norm(p1 - p2)
+                if d < 0.75 or d > 1.35:
+                    needs_repair = True
+                    break
+
+    if not needs_repair:
+        return mol
+
+    mol_no_h = Chem.RemoveHs(mol)
+    mol_h = Chem.AddHs(mol_no_h, addCoords=True)
+    try:
+        mp = AllChem.MMFFGetMoleculeProperties(mol_h)
+        if mp is not None:
+            ff = AllChem.MMFFGetMoleculeForceField(mol_h, mp)
+            for i, a in enumerate(mol_h.GetAtoms()):
+                if a.GetAtomicNum() > 1:
+                    ff.AddFixedPoint(i)
+            ff.Minimize(maxIts=500)
+    except Exception:
+        pass
+    return mol_h
+
+
 class SDFParser:
     """Parser for SDF / MOL files using RDKit."""
 
@@ -230,13 +270,13 @@ class SDFParser:
         mols = []
         for i, mol in enumerate(suppl):
             if mol is not None:
-                mols.append(mol)
+                mols.append(sanitize_hydrogens_3d(mol))
             else:
                 try:
                     mol_relaxed = Chem.MolFromMolFile(str(filepath), removeHs=False, sanitize=False)
                     if mol_relaxed is not None:
                         Chem.Kekulize(mol_relaxed, clearAromaticFlags=True)
-                        mols.append(mol_relaxed)
+                        mols.append(sanitize_hydrogens_3d(mol_relaxed))
                 except Exception:
                     pass
         return mols
@@ -244,6 +284,7 @@ class SDFParser:
     @staticmethod
     def mol_to_system(mol: Chem.Mol, name: str = "LIG") -> MolecularSystem:
         """Converts an RDKit Mol object into a MolecularSystem with Gasteiger charges."""
+        mol = sanitize_hydrogens_3d(mol)
         try:
             AllChem.ComputeGasteigerCharges(mol)
         except Exception:

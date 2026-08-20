@@ -169,3 +169,55 @@ def create_rdock_nonbonded_forces(
     hyd.addGlobalParameter("w_hyd", weights.hydrophobic)
 
     return RDockNonbondedForces([vdw_inter, vdw_intra, polar_inter, polar_intra, repul, hyd])
+
+
+def create_combined_search_force(
+    weights: ScoreWeights,
+    cutoff_distance_nm: float = 1.2,
+    soft_delta_nm: float = 0.05,
+    dielectric_slope: float = 2.0,
+    repul_distance_nm: float = 0.24,
+    repul_k: float = 20000.0,
+) -> RDockNonbondedForces:
+    """
+    Same physics as create_rdock_nonbonded_forces (VDW + POLAR + H-bond + REPUL +
+    HYD, inter and intra), but summed into a *single* CustomNonbondedForce
+    instead of six. Six separate forces means six separate neighbor-list builds
+    against the full receptor every time positions change -- fine for one-off
+    scoring, but ruinous for a GA inner loop that evaluates thousands of
+    candidate poses (each a large jump, not a small perturbation, so neighbor
+    lists can't be reused). Callers that need genuinely decomposed per-term
+    energies (score/minimize/dock/mc, and each GA run's final reported pose)
+    should use create_rdock_nonbonded_forces instead; this is for fast relative
+    ranking only.
+    """
+    expr = (
+        "w_vdw * (is_inter * E_vdw + is_intra * w_intra_r * E_vdw) + "
+        "is_inter * (w_pol * E_polar + w_hb * E_hb) + is_intra * w_intra_r * E_polar + "
+        "is_inter * w_repul * is_polar_pair * step(r_min_polar - r_eff) * k_repul * (r_min_polar - r_eff)^2 + "
+        "is_inter * w_hyd * E_hyd;"
+        "E_vdw = 4.0 * eps * ((sig / r_eff)^8 - (sig / r_eff)^4);"
+        "E_polar = 138.935456 * (q1 * q2) / (dielectric_slope * r_eff^2);"
+        "E_hb = - 12.0 * is_hb_pair * exp(- (r_eff - 0.28)^2 / 0.02);"
+        "E_hyd = - 3.0 * is_hyd_pair * exp(- (r_eff - 0.38)^2 / 0.04);"
+        "is_hb_pair = (is_don1 * is_acc2 + is_don2 * is_acc1);"
+        "is_hyd_pair = (is_hyd1 * is_hyd2);"
+        "is_polar_pair = min(1.0, is_don1 + is_acc1) * min(1.0, is_don2 + is_acc2);"
+        "r_eff = sqrt(r^2 + soft_delta^2);"
+        "sig = 0.5 * (sig1 + sig2);"
+        "eps = sqrt(eps1 * eps2);"
+        "is_inter = (is_lig1 + is_lig2 - 2.0 * is_lig1 * is_lig2);"
+        "is_intra = (is_lig1 * is_lig2);"
+    )
+    force = _new_force(expr, GROUP_VDW_INTER, "RDockCombinedSearchForce", cutoff_distance_nm)
+    force.addGlobalParameter("w_vdw", weights.vdw)
+    force.addGlobalParameter("w_intra_r", weights.intra)
+    force.addGlobalParameter("w_pol", weights.polar)
+    force.addGlobalParameter("w_hb", weights.hbond)
+    force.addGlobalParameter("w_repul", weights.repul)
+    force.addGlobalParameter("w_hyd", weights.hydrophobic)
+    force.addGlobalParameter("soft_delta", soft_delta_nm)
+    force.addGlobalParameter("dielectric_slope", dielectric_slope)
+    force.addGlobalParameter("r_min_polar", repul_distance_nm)
+    force.addGlobalParameter("k_repul", repul_k)
+    return RDockNonbondedForces([force])
