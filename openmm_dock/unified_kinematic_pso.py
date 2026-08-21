@@ -151,3 +151,149 @@ class UnifiedKinematicPSOEngine:
         state = self.context.getState(getEnergy=True)
         score_kcal = float(state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) * 0.239006)
         return score_kcal, c_lig, rec_coords
+
+    def run_unified_pso(
+        self,
+        n_particles: int = 15,
+        n_iterations: int = 20,
+        w: float = 0.729,
+        c1: float = 1.494,
+        c2: float = 1.494
+    ) -> Tuple[Chem.Mol, np.ndarray, float, List[Chem.Mol], List[np.ndarray]]:
+        """
+        Executes Unified Kinematic PSO across coupled Macrocycle + Receptor space.
+        Returns: (best_lig_mol, best_rec_coords, best_score, lig_swarm_frames, rec_movie_frames)
+        """
+        particles: List[UnifiedSwarmParticle] = []
+        g_best_score = 999999.0
+        g_best_trans = np.zeros(3)
+        g_best_rot = np.zeros(3)
+        g_best_ring = np.zeros(self.num_ring_drivers)
+        g_best_exo = np.zeros(self.num_exo)
+        g_best_rec = np.zeros(self.num_rec_chi)
+
+        # Initialize swarm particles
+        for p_id in range(n_particles):
+            if p_id == 0:
+                t = np.zeros(3)
+                r = np.zeros(3)
+                ring = np.zeros(self.num_ring_drivers)
+                exo = np.zeros(self.num_exo)
+                rec = np.zeros(self.num_rec_chi)
+            else:
+                t = np.random.uniform(-1.5, 1.5, 3)
+                r = np.random.uniform(-0.5, 0.5, 3)
+                ring = np.random.uniform(-np.pi / 6, np.pi / 6, self.num_ring_drivers)
+                exo = np.random.uniform(-np.pi / 4, np.pi / 4, self.num_exo)
+                rec = np.random.uniform(-np.pi / 6, np.pi / 6, self.num_rec_chi)
+
+            score, _, _ = self.evaluate_coupled_state(t, r, ring, exo, rec)
+
+            p = UnifiedSwarmParticle(
+                particle_id=p_id,
+                conformer_seed_id=0,
+                trans=t.copy(),
+                rot_vec=r.copy(),
+                ring_driver_angles=ring.copy(),
+                exo_dihedrals=exo.copy(),
+                rec_chi_angles=rec.copy(),
+                v_trans=np.random.uniform(-0.5, 0.5, 3),
+                v_rot=np.random.uniform(-0.3, 0.3, 3),
+                v_ring=np.random.uniform(-0.3, 0.3, self.num_ring_drivers),
+                v_exo=np.random.uniform(-0.3, 0.3, self.num_exo),
+                v_rec=np.random.uniform(-0.3, 0.3, self.num_rec_chi),
+                p_best_trans=t.copy(),
+                p_best_rot=r.copy(),
+                p_best_ring=ring.copy(),
+                p_best_exo=exo.copy(),
+                p_best_rec=rec.copy(),
+                p_best_score=score,
+                current_score=score
+            )
+            particles.append(p)
+
+            if score < g_best_score:
+                g_best_score = score
+                g_best_trans = t.copy()
+                g_best_rot = r.copy()
+                g_best_ring = ring.copy()
+                g_best_exo = exo.copy()
+                g_best_rec = rec.copy()
+
+        lig_frames: List[Chem.Mol] = []
+        rec_frames: List[np.ndarray] = []
+
+        # Evolution Loop
+        for it in range(n_iterations):
+            for p in particles:
+                r1, r2 = np.random.uniform(0, 1), np.random.uniform(0, 1)
+
+                # Update Velocities
+                p.v_trans = w * p.v_trans + c1 * r1 * (p.p_best_trans - p.trans) + c2 * r2 * (g_best_trans - p.trans)
+                p.trans += np.clip(p.v_trans, -1.5, 1.5)
+
+                diff_r_p = self._toroidal_sub(p.p_best_rot, p.rot_vec)
+                diff_r_g = self._toroidal_sub(g_best_rot, p.rot_vec)
+                p.v_rot = w * p.v_rot + c1 * r1 * diff_r_p + c2 * r2 * diff_r_g
+                p.rot_vec = (p.rot_vec + np.clip(p.v_rot, -0.6, 0.6) + np.pi) % (2 * np.pi) - np.pi
+
+                diff_ring_p = self._toroidal_sub(p.p_best_ring, p.ring_driver_angles)
+                diff_ring_g = self._toroidal_sub(g_best_ring, p.ring_driver_angles)
+                p.v_ring = w * p.v_ring + c1 * r1 * diff_ring_p + c2 * r2 * diff_ring_g
+                p.ring_driver_angles = (p.ring_driver_angles + np.clip(p.v_ring, -0.5, 0.5) + np.pi) % (2 * np.pi) - np.pi
+
+                diff_exo_p = self._toroidal_sub(p.p_best_exo, p.exo_dihedrals)
+                diff_exo_g = self._toroidal_sub(g_best_exo, p.exo_dihedrals)
+                p.v_exo = w * p.v_exo + c1 * r1 * diff_exo_p + c2 * r2 * diff_exo_g
+                p.exo_dihedrals = (p.exo_dihedrals + np.clip(p.v_exo, -0.6, 0.6) + np.pi) % (2 * np.pi) - np.pi
+
+                diff_rec_p = self._toroidal_sub(p.p_best_rec, p.rec_chi_angles)
+                diff_rec_g = self._toroidal_sub(g_best_rec, p.rec_chi_angles)
+                p.v_rec = w * p.v_rec + c1 * r1 * diff_rec_p + c2 * r2 * diff_rec_g
+                p.rec_chi_angles = (p.rec_chi_angles + np.clip(p.v_rec, -0.5, 0.5) + np.pi) % (2 * np.pi) - np.pi
+
+                # Evaluate Coupled Energy
+                score, c_lig, c_rec = self.evaluate_coupled_state(
+                    p.trans, p.rot_vec, p.ring_driver_angles, p.exo_dihedrals, p.rec_chi_angles
+                )
+                p.current_score = score
+
+                if score < p.p_best_score:
+                    p.p_best_score = score
+                    p.p_best_trans = p.trans.copy()
+                    p.p_best_rot = p.rot_vec.copy()
+                    p.p_best_ring = p.ring_driver_angles.copy()
+                    p.p_best_exo = p.exo_dihedrals.copy()
+                    p.p_best_rec = p.rec_chi_angles.copy()
+
+                if score < g_best_score:
+                    g_best_score = score
+                    g_best_trans = p.trans.copy()
+                    g_best_rot = p.rot_vec.copy()
+                    g_best_ring = p.ring_driver_angles.copy()
+                    g_best_exo = p.exo_dihedrals.copy()
+                    g_best_rec = p.rec_chi_angles.copy()
+
+                # Save Synchronized Movie Frames
+                mol_f = Chem.Mol(self.lig_mol)
+                conf_f = mol_f.GetConformer()
+                for i in range(mol_f.GetNumAtoms()):
+                    conf_f.SetAtomPosition(i, Point3D(float(c_lig[i][0]), float(c_lig[i][1]), float(c_lig[i][2])))
+                mol_f.SetProp("ITERATION", str(it + 1))
+                mol_f.SetProp("PARTICLE_ID", str(p.particle_id + 1))
+                mol_f.SetProp("COUPLED_SCORE_KCAL", f"{score:.2f}")
+                mol_f.SetProp("SWARM_BEST_SCORE", f"{g_best_score:.2f}")
+                lig_frames.append(mol_f)
+                rec_frames.append(c_rec)
+
+        # Build final best complex
+        _, best_lig_coords, best_rec_coords = self.evaluate_coupled_state(
+            g_best_trans, g_best_rot, g_best_ring, g_best_exo, g_best_rec
+        )
+        best_mol = Chem.Mol(self.lig_mol)
+        conf_b = best_mol.GetConformer()
+        for i in range(best_mol.GetNumAtoms()):
+            conf_b.SetAtomPosition(i, Point3D(float(best_lig_coords[i][0]), float(best_lig_coords[i][1]), float(best_lig_coords[i][2])))
+        best_mol.SetProp("FINAL_SCORE_KCAL", f"{g_best_score:.3f}")
+
+        return best_mol, best_rec_coords, g_best_score, lig_frames, rec_frames

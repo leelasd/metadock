@@ -69,6 +69,7 @@ def main():
     teth_p.add_argument("-ref", "--reference", required=True, help="Reference co-crystal ligand SDF")
     teth_p.add_argument("-i", "--input", required=True, help="Input query ligands SDF")
     teth_p.add_argument("-o", "--output", required=True, help="Output SDF file for tethered docked poses")
+    teth_p.add_argument("-n", "--runs", type=int, default=10, help="Number of docking runs / poses per ligand (default: 10)")
     teth_p.add_argument("--protonate", action="store_true", help="Automatically perceive and set physiological pH 7.4 ionization states for ligands")
 
     # Command: mc (Monte Carlo Basin-Hopping)
