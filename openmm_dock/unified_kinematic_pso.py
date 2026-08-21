@@ -29,7 +29,7 @@ class UnifiedSwarmParticle:
     conformer_seed_id: int       # Multi-conformer template ID
     trans: np.ndarray            # (3,) Ligand translation
     rot_vec: np.ndarray          # (3,) Ligand orientation
-    ring_driver_angles: np.ndarray # (4,) 4 Ring IK driver dihedrals
+    ring_driver_angles: np.ndarray # (k_ring,) Ring IK driver dihedrals
     exo_dihedrals: np.ndarray    # (k_exo,) Ligand side-chain angles
     rec_chi_angles: np.ndarray   # (k_rec,) Receptor chi angles
     
@@ -66,8 +66,14 @@ class UnifiedKinematicPSOEngine:
         self.two_tier_lig = TwoTierMacrocycleEngine(ligand_mol)
         self.rec_kin = ReceptorSideChainKinematics(receptor_pdb_path, pocket_center, flex_radius)
         
-        # Upgraded to 4 Ring Drivers (Joints 1, 3, 5, 8) for Full Pucker Envelope Exploration
-        self.driver_joint_indices = [1, 3, 5, min(8, len(self.two_tier_lig.ik_engine.joints) - 1)]
+        # Adaptive Ring Drivers: only for macrocyclic rings (>=8 atoms)
+        num_joints = len(self.two_tier_lig.ik_engine.joints)
+        if num_joints >= 4:
+            self.driver_joint_indices = [1, 3, 5, min(8, num_joints - 1)]
+        elif num_joints > 0:
+            self.driver_joint_indices = [0]
+        else:
+            self.driver_joint_indices = []
         self.num_ring_drivers = len(self.driver_joint_indices)
         self.num_exo = len(self.two_tier_lig.exo_joints)
         
@@ -88,8 +94,8 @@ class UnifiedKinematicPSOEngine:
             else mm.Context(self.system, self.integrator)
         )
         
-        print(f"[*] Upgraded Unified Kinematic Engine Initialized:")
-        print(f"    • Macrocycle: 10 Ring Joints ({self.num_ring_drivers} Active IK Drivers) + {self.num_exo} Exocyclic FK Joints")
+        print(f"[*] Unified Kinematic Engine Initialized:")
+        print(f"    • Ligand    : {self.num_ring_drivers} Ring IK Drivers + {self.num_exo} Rotatable FK Joints")
         print(f"    • Receptor  : {len(self.rec_kin.flex_residues)} Pocket Residues ({self.num_rec_chi} Chi Joints)")
         print(f"    • Total Coupled Degrees of Freedom: {6 + self.num_ring_drivers + self.num_exo + self.num_rec_chi}")
 
@@ -108,24 +114,24 @@ class UnifiedKinematicPSOEngine:
     ) -> Tuple[float, np.ndarray, np.ndarray]:
         """
         Evaluates coupled energy on OpenMM GPU:
-        1. Solves Multi-Driver Macrocycle IK loop closure (4 Drivers)
-        2. Rotates Exocyclic Ligand Arms (9 FK Joints)
-        3. Rotates Receptor Active-Site Side Chains (31 Chi Joints)
+        1. Solves Macrocycle IK loop closure (if macrocyclic)
+        2. Rotates Ligand Rotatable Arms (FK Joints)
+        3. Rotates Receptor Active-Site Side Chains (Chi Joints)
         Returns: (score_kcal, lig_coords, rec_coords)
         """
         # A. Receptor Coordinates
         chi_dict = {key: float(rec_chi[i]) for i, key in enumerate(self.all_chi_keys)}
         rec_coords = self.rec_kin.forward_kinematics_sidechains(chi_dict)
         
-        # B. Macrocycle Coordinates (Multi-Driver Ring IK)
+        # B. Macrocycle Coordinates (Ring IK)
         start_c = base_coords if base_coords is not None else self.two_tier_lig.base_coords
-        d_dict = {self.driver_joint_indices[i]: float(ring_drivers[i]) for i in range(min(len(ring_drivers), self.num_ring_drivers))}
+        if self.num_ring_drivers > 0:
+            d_dict = {self.driver_joint_indices[i]: float(ring_drivers[i]) for i in range(min(len(ring_drivers), self.num_ring_drivers))}
+            c_lig, _, _ = self.two_tier_lig.ik_engine.solve_loop_closure(start_c, driver_angles=d_dict)
+        else:
+            c_lig = start_c.copy()
         
-        c_lig, _, _ = self.two_tier_lig.ik_engine.solve_loop_closure(
-            start_c, driver_angles=d_dict
-        )
-        
-        # C. Exocyclic Ligand Arms (FK)
+        # C. Exocyclic / Small Molecule Ligand Arms (FK)
         for j_idx in range(min(len(exo_dihedrals), self.num_exo)):
             c_lig = self.two_tier_lig.apply_exocyclic_rotation(c_lig, j_idx, float(exo_dihedrals[j_idx]))
             

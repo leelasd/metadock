@@ -8,6 +8,12 @@ from .pharmacophore import PharmaPoint, parse_pharma_restr, find_ligand_pharma_f
 from .tether import find_tethered_atoms_mcs, TetherConstraint
 from .solvent import load_solvent_waters
 from .engine import DockingEngine, DockingResult
+from .collaborative_kinematic_metadynamics import (
+    CollaborativeKinematicMetaDEngine,
+    CollaborativeMetaDParams,
+    SharedMetadynamicsArchive,
+    SharedBasin,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -28,4 +34,9 @@ __all__ = [
     "load_solvent_waters",
     "DockingEngine",
     "DockingResult",
+    "CollaborativeKinematicMetaDEngine",
+    "CollaborativeMetaDParams",
+    "SharedMetadynamicsArchive",
+    "SharedBasin",
 ]
+
