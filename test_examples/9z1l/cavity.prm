@@ -1,0 +1,14 @@
+RBT_PARAMETER_FILE_V1.00
+TITLE KIT_V654A_9Z1L_A1CZZ
+
+RECEPTOR_FILE receptor.mol2
+RECEPTOR_FLEX 3.0
+
+SECTION CAVITY
+    SCORING_FUNCTION    RbtCavityGridSF
+    WEIGHT              1.0
+    CENTER              (16.92, -31.66, 18.54)
+    RADIUS              15.0
+    GRID                0.5
+    QUAD_ALL            TRUE
+END_SECTION

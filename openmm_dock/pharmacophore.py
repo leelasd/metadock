@@ -86,8 +86,13 @@ def find_ligand_pharma_features(mol: Chem.Mol) -> Dict[str, List[List[int]]]:
         if elem in ["O", "N", "F"] and atom.GetFormalCharge() <= 0:
             features["Acc"].append([idx])
 
-        # Donors: N, O with attached hydrogen
-        if elem in ["N", "O"] and atom.GetTotalNumHs() > 0:
+        # Donors: N, O with attached hydrogen. includeNeighbors=True is
+        # required here: GetTotalNumHs() alone only reports the packed
+        # implicit/explicit-H *count* property and returns 0 for any atom
+        # whose hydrogens were added as explicit graph neighbors (e.g. via
+        # Chem.AddHs(), which many ligand SDFs in this repo go through),
+        # silently finding zero donors on such molecules otherwise.
+        if elem in ["N", "O"] and atom.GetTotalNumHs(includeNeighbors=True) > 0:
             features["Don"].append([idx])
 
         # Hydrophobic
