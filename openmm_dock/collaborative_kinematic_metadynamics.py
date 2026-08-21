@@ -50,8 +50,10 @@ class SharedBasin:
 
 class SharedMetadynamicsArchive:
     """
-    Thread-safe shared memory archive that records visited local basins from all islands
-    and computes dynamic repulsive Gaussian bias potentials.
+    Shared memory archive that records visited local basins from all islands
+    and computes dynamic repulsive Gaussian bias potentials. Islands are
+    processed sequentially within a single process (see
+    run_collaborative_docking), not concurrently, so no locking is needed here.
     """
     def __init__(
         self,
@@ -112,7 +114,10 @@ class SharedMetadynamicsArchive:
         for b in self.basins:
             rmsd = float(np.sqrt(np.mean(np.sum((coords - b.coords) ** 2, axis=1))))
             if rmsd < self.min_basin_rmsd:
-                # Close to an existing basin: increase existing hill slightly or skip
+                # Close to an existing basin: skip registering a duplicate.
+                # (Repeated visits to this region get no additional deterrence
+                # beyond the first deposit -- the existing hill's height is not
+                # reinforced.)
                 return None
                 
         # Well-Tempered height scaling: W = W0 * exp(-V_bias / (k_B * delta_T))
@@ -222,6 +227,11 @@ class CollaborativeMetaDParams:
     temperature_k: float = 300.0
     min_basin_rmsd: float = 1.60
     basin_deposit_interval: int = 5
+
+    # Guide-score CV beacons (same names/defaults as global_blind_docking.py's
+    # BlindDockingParams.k_contact_beacon / k_depth_beacon, for consistency)
+    k_contact_beacon: float = 0.80
+    k_depth_beacon: float = 4.00
 
 
 class CollaborativeKinematicMetaDEngine:
@@ -335,7 +345,9 @@ class CollaborativeKinematicMetaDEngine:
         rot_vec: np.ndarray,
         ring_drivers: np.ndarray,
         exo_dihedrals: np.ndarray,
-        conformer_seed_id: int
+        conformer_seed_id: int,
+        k_contact_beacon: float = 0.80,
+        k_depth_beacon: float = 4.00
     ) -> Tuple[float, float, np.ndarray]:
         """
         Evaluates coupled 19D kinematics on OpenMM GPU:
@@ -343,6 +355,10 @@ class CollaborativeKinematicMetaDEngine:
         2. Rotates Exocyclic FK dihedrals
         3. Applies SE(3) translation & rotation
         Returns: (guide_score_kcal, pure_openmm_score_kcal, cartesian_coords_angstrom)
+
+        k_contact_beacon/k_depth_beacon match the names and default values of
+        global_blind_docking.py's BlindDockingParams.k_contact_beacon /
+        k_depth_beacon, for consistency across the swarm-search engines.
         """
         seed_idx = conformer_seed_id % self.num_conformer_seeds
         base_c = self.conformer_templates[seed_idx]
@@ -375,7 +391,7 @@ class CollaborativeKinematicMetaDEngine:
         
         # Compute smooth contact beacon guidance
         zeta_d, q_c, _, _ = self.compute_cvs(c_lig)
-        guide_score = raw_score_kcal - 1.25 * q_c + 3.0 * zeta_d
+        guide_score = raw_score_kcal - k_contact_beacon * q_c + k_depth_beacon * zeta_d
         return guide_score, raw_score_kcal, c_lig
 
 
@@ -429,7 +445,10 @@ class CollaborativeKinematicMetaDEngine:
                 v_ring = np.random.normal(scale=0.2, size=self.num_ring_drivers)
                 v_exo = np.random.normal(scale=0.2, size=self.num_exo)
                 
-                guide_s, phys_score, coords = self.evaluate_kinematics(trans, rot_vec, ring_drivers, exo_dihedrals, seed_id)
+                guide_s, phys_score, coords = self.evaluate_kinematics(
+                    trans, rot_vec, ring_drivers, exo_dihedrals, seed_id,
+                    k_contact_beacon=params.k_contact_beacon, k_depth_beacon=params.k_depth_beacon
+                )
                 bias = archive.compute_bias(coords)
                 eff_score = guide_s + bias
                 
@@ -548,7 +567,10 @@ class CollaborativeKinematicMetaDEngine:
                         p.v_trans *= -0.5 # Reflective wall
                         
                     # 3. Evaluate OpenMM + Shared Metadynamics Repulsion
-                    guide_s, phys_score, coords = self.evaluate_kinematics(p.trans, p.rot_vec, p.ring_drivers, p.exo_dihedrals, p.conformer_seed_id)
+                    guide_s, phys_score, coords = self.evaluate_kinematics(
+                        p.trans, p.rot_vec, p.ring_drivers, p.exo_dihedrals, p.conformer_seed_id,
+                        k_contact_beacon=params.k_contact_beacon, k_depth_beacon=params.k_depth_beacon
+                    )
                     zeta_d, q_c, r_g_all, r_g_ring = self.compute_cvs(coords)
                     
                     shared_bias = archive.compute_bias(coords)
@@ -622,8 +644,15 @@ class CollaborativeKinematicMetaDEngine:
                     all_trajectory_mols.append(mol_f)
 
             # 3. Periodic Basin Registration to Shared Metadynamics Archive
-
-            if (it % params.basin_deposit_interval == 0 or it == params.n_iterations) and (it <= phase2_start + 5):
+            # New-basin deposition freezes after phase2_start + 5 (into the final
+            # annealing phase); the "or it == ..." clause guarantees one last
+            # deposit at that freeze point even if it isn't a multiple of
+            # basin_deposit_interval. (Previously compared against
+            # params.n_iterations, which is > phase2_start + 5 for any
+            # n_iterations > ~14 under the default 0.65 phase split, making that
+            # clause unreachable.)
+            deposit_freeze_iter = phase2_start + 5
+            if (it % params.basin_deposit_interval == 0 or it == deposit_freeze_iter) and (it <= deposit_freeze_iter):
                 new_basins_count = 0
                 for island in islands:
                     if island.l_best_coords is not None:

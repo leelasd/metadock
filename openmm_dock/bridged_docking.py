@@ -2,7 +2,7 @@
 Automated Bridged Two-Stage Docking Engine for openmm-dock.
 Unifies:
 Stage 1: Global Swarm-Metadynamics Ingress from Bulk Solvent (Rigid Receptor).
-The Bridge Gate: Automated Detection of Pocket Ingress (zeta_depth <= 4.0 Å and Q_contacts >= 200).
+The Bridge Gate: Automated Detection of Pocket Ingress (zeta_depth <= 5.0 Å from cavity centroid).
 Stage 2: In-Pocket Kinematic Induced-Fit Relaxation (Two-Tier IK/FK + Receptor chi1-chi4 Plasticity).
 Works seamlessly on BOTH small molecules and macrocyclic systems.
 """
@@ -24,6 +24,7 @@ from openmm import unit
 from .unified_kinematic_pso import UnifiedKinematicPSOEngine
 from .global_blind_docking import GlobalBlindDockingEngine, BlindDockingParams
 from .inverse_kinematics import TwoTierMacrocycleEngine
+from .generalized_cv import GeneralizedCVEngine
 
 
 class BridgedTwoStageDockingEngine:
@@ -129,7 +130,17 @@ class BridgedTwoStageDockingEngine:
         all_frames_lig = list(s1_lig_frames)
         all_frames_rec = list(s1_rec_frames)
         master_log = list(s1_log)
-        
+
+        # CV calculator for logging real Stage 2 q_contacts (built from Stage 2's
+        # own flexible-pocket definition, not Stage 1's rigid flex_radius=0.0 one).
+        stage2_pocket_indices: List[int] = []
+        for r in self.engine_stage2.rec_kin.flex_residues:
+            stage2_pocket_indices.extend(r.all_atom_indices)
+        stage2_cv_calc = GeneralizedCVEngine(
+            pocket_center=self.engine_stage2.rec_kin.pocket_center,
+            ring_atom_indices=getattr(two_tier.ik_engine, "ring_atoms", None)
+        )
+
         best_s2_score = 999999.0
         best_s2_lig_coords = coords_s1.copy()
         best_s2_rec_coords = self.engine_stage2.rec_kin.base_coords.copy()
@@ -163,12 +174,19 @@ class BridgedTwoStageDockingEngine:
                 score_s2 = float(state_s2.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole) * 0.239006)
                 
                 rmsd_now = float(np.sqrt(np.mean(np.sum((opt_lig - ref_coords)**2, axis=1)))) if ref_coords is not None else 0.0
-                
+
+                if stage2_pocket_indices:
+                    q_contacts_s2, _ = stage2_cv_calc.compute_contact_coordination(
+                        opt_lig, opt_rec[stage2_pocket_indices]
+                    )
+                else:
+                    q_contacts_s2 = 0.0
+
                 if score_s2 < best_s2_score:
                     best_s2_score = score_s2
                     best_s2_lig_coords = opt_lig
                     best_s2_rec_coords = opt_rec
-                    
+
                 step_counter += 1
                 master_log.append({
                     "frame": step_counter,
@@ -177,7 +195,7 @@ class BridgedTwoStageDockingEngine:
                     "particle_id": 1,
                     "conformer_seed": 1,
                     "zeta_depth_A": float(np.linalg.norm(opt_lig.mean(axis=0) - self.pocket_center)),
-                    "q_contacts": 550.0,
+                    "q_contacts": q_contacts_s2,
                     "rmsd_to_xtal_A": rmsd_now,
                     "phys_score_kcal": score_s2,
                     "guide_score_kcal": score_s2
