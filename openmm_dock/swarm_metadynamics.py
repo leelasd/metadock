@@ -19,6 +19,7 @@ from openmm import unit
 
 from .unified_kinematic_pso import UnifiedKinematicPSOEngine
 from .metadynamics import VisitedBasin
+from .kinematic_utils import toroidal_diff
 
 
 class SwarmMetadynamicsEngine:
@@ -48,7 +49,7 @@ class SwarmMetadynamicsEngine:
 
     @staticmethod
     def _toroidal_sub(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.arctan2(np.sin(a - b), np.cos(a - b))
+        return toroidal_diff(a, b)
 
     def compute_shared_bias_and_gradient(
         self,

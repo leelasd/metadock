@@ -15,6 +15,7 @@ import openmm as mm
 from openmm import unit
 
 from .engine import DockingEngine
+from .kinematic_utils import find_downstream_atoms, identify_rotatable_bonds
 
 
 @dataclass
@@ -86,27 +87,8 @@ class MacrocycleInverseKinematics:
         (including all attached hydrogens and exocyclic side-chains) without crossing begin_idx
         or the cut closure bond (cut_a1 - cut_a2).
         """
-        # Block backwards path to begin_idx and block the cut closure bond
-        blocked_edges = {
-            (min(begin_idx, split_idx), max(begin_idx, split_idx)),
-            (min(self.cut_a1, self.cut_a2), max(self.cut_a1, self.cut_a2))
-        }
-        
-        visited: Set[int] = {split_idx}
-        queue = [split_idx]
-        
-        while queue:
-            curr = queue.pop(0)
-            for nbr in self.mol.GetAtomWithIdx(curr).GetNeighbors():
-                n_idx = nbr.GetIdx()
-                edge = (min(curr, n_idx), max(curr, n_idx))
-                if edge in blocked_edges:
-                    continue
-                if n_idx not in visited:
-                    visited.add(n_idx)
-                    queue.append(n_idx)
-                    
-        return sorted(list(visited))
+        cut_edge = (min(self.cut_a1, self.cut_a2), max(self.cut_a1, self.cut_a2))
+        return find_downstream_atoms(self.mol, begin_idx, split_idx, extra_blocked_edges={cut_edge})
 
     def solve_loop_closure(
         self,
@@ -279,16 +261,10 @@ class TwoTierMacrocycleEngine:
         self.ring_set = set(self.ik_engine.ring_atoms)
         
         # Identify exocyclic rotatable bonds
-        rot_smarts = Chem.MolFromSmarts("[!$(*#*)&!D1]-!@[!$(*#*)&!D1]")
-        matches = self.mol.GetSubstructMatches(rot_smarts)
-        
+        matches = identify_rotatable_bonds(self.mol)
+
         self.exo_joints: List[ExocyclicJoint] = []
-        seen = set()
         for a1, a2 in matches:
-            pair = tuple(sorted([a1, a2]))
-            if pair in seen:
-                continue
-            seen.add(pair)
             b = self.mol.GetBondBetweenAtoms(a1, a2)
             if not b.IsInRing():
                 # If a1 is in the ring or closer to the ring, moving subtree is on a2 side
@@ -314,16 +290,7 @@ class TwoTierMacrocycleEngine:
 
     def _find_exocyclic_subtree(self, begin_idx: int, split_idx: int) -> List[int]:
         """Finds all atoms downstream on the exocyclic side without crossing begin_idx."""
-        visited: Set[int] = {split_idx}
-        queue = [split_idx]
-        while queue:
-            curr = queue.pop(0)
-            for nbr in self.mol.GetAtomWithIdx(curr).GetNeighbors():
-                n_idx = nbr.GetIdx()
-                if n_idx != begin_idx and n_idx not in visited:
-                    visited.add(n_idx)
-                    queue.append(n_idx)
-        return sorted(list(visited))
+        return find_downstream_atoms(self.mol, begin_idx, split_idx)
 
     def apply_exocyclic_rotation(
         self,

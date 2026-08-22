@@ -12,6 +12,10 @@ from rdkit.Geometry import Point3D
 
 from openmm_dock.unified_kinematic_pso import UnifiedKinematicPSOEngine
 from openmm_dock.global_blind_docking import GlobalBlindDockingEngine, BlindDockingParams
+from openmm_dock.engine import DockingEngine
+from openmm_dock.cavity import CavityDefinition
+from openmm_dock.kinematics import KinematicDockingEngine, KinematicParticleSwarmOptimizer
+from openmm_dock.scoring import ScoreWeights
 
 DEMO_DIR = Path(__file__).resolve().parent
 rec_path = DEMO_DIR / "receptor.pdb"
@@ -47,7 +51,26 @@ w_u = Chem.SDWriter(str(out_unaligned))
 w_u.write(unaligned_mol)
 w_u.close()
 
-# 2. Setup Unified Engine and Blind Docking Engine
+# 2. Setup Unified Engine and Blind Docking Engine, FULL VDW STRENGTH.
+#
+# An earlier version of this script softened VDW (weight 0.35) during the
+# swarm search, on the theory that a full-strength steric wall traps
+# particles behind decoy surface sites. Measured effect: it didn't help --
+# 5 independent multi-start attempts under soft VDW all converged to a
+# narrow 5.8-9.2 A band (a systematic plateau, not the scattered good/bad
+# spread genuine variance would produce), no better than 3 attempts had.
+# Root cause: evaluate_global_score's beacon_energy term (k_contact_beacon
+# * q_contacts + k_depth_beacon * zeta_depth) is NOT scaled by the vdw
+# weight, but the physical VDW term is the main thing that discriminates a
+# PRECISELY correct pose from one that's merely "generally in the pocket,
+# contacts roughly satisfied." Measured directly: softening vdw to 0.35
+# shrinks the physical score at the crystal pose by ~122 kcal/mol (-282 ->
+# -160), comparable in size to the beacon terms themselves -- diluting the
+# one signal capable of telling the true minimum apart from many similar-
+# scoring nearby poses, while the beacon terms (unaffected) keep pulling
+# the swarm toward "anywhere with good contacts," not the specific right
+# spot. Reverted to full strength; escaping decoys is left to the existing
+# metadynamics repulsion (bias_val) mechanism instead.
 unified_engine = UnifiedKinematicPSOEngine(
     receptor_pdb_path=rec_path,
     pocket_center=pocket_center,
@@ -56,8 +79,9 @@ unified_engine = UnifiedKinematicPSOEngine(
 )
 
 params = BlindDockingParams(
-    n_particles=30,
-    n_iterations=20,
+    n_particles=45,
+    n_iterations=30,
+    num_conformer_seeds=10,
     search_box_size=22.0,
     w_start=0.85,
     w_end=0.40,
@@ -67,23 +91,82 @@ params = BlindDockingParams(
     k_depth_beacon=3.0,
     gaussian_w0=8.0,
     gaussian_sigma=0.50,
-    bias_gamma=6.0
+    bias_gamma=6.0,
+    lbfgs_iterations=300
 )
 
 blind_engine = GlobalBlindDockingEngine(unified_engine, params)
 
-# 3. Execute Global Blind Docking
-print(f"\n[*] Launching Global Blind Swarm Metadynamics (30 Walkers × 20 Iterations = 600 Frames)...")
-best_lig, best_rec_coords, best_score, lig_frames, rec_frames, blind_log = blind_engine.run_blind_docking(
-    unaligned_start_mol=unaligned_mol,
-    reference_xtal_mol=xtal_mol
-)
+# 3. Execute Global Blind Docking -- multi-start: 5 independent attempts with
+# different random seeds (a1czz_unaligned_start.sdf's scramble plus each
+# attempt's own internal 10-conformer ETKDG seeding gives real starting
+# diversity). A real blind docking run has no access to the crystal answer,
+# so ranking by score (not RMSD) matches how multi-start docking is
+# actually used/evaluated in practice.
+N_ATTEMPTS = 5
+print(f"\n[*] Launching Global Blind Swarm Metadynamics: {N_ATTEMPTS}x independent attempts "
+      f"(45 Walkers × 30 Iterations = 1350 frames each)...")
 
-final_rmsd = float(best_lig.GetProp("FINAL_RMSD_TO_XTAL_A"))
-print(f"\n[✓] Global Blind Docking Completed!")
-print(f"    • Starting RMSD : {init_rmsd:.2f} Å (Bulk Solvent)")
-print(f"    • Converged RMSD: {final_rmsd:.2f} Å")
-print(f"    • Final Physical Score: {best_score:.3f} kcal/mol")
+attempts = []
+for attempt_idx in range(N_ATTEMPTS):
+    np.random.seed(1000 + attempt_idx)
+    print(f"\n--- Attempt {attempt_idx + 1}/{N_ATTEMPTS} (seed={1000 + attempt_idx}) ---")
+    result = blind_engine.run_blind_docking(
+        unaligned_start_mol=unaligned_mol,
+        reference_xtal_mol=xtal_mol
+    )
+    attempt_score = result[2]
+    attempt_rmsd = float(result[0].GetProp("FINAL_RMSD_TO_XTAL_A"))
+    print(f"    Attempt {attempt_idx + 1} result: Guide Score = {attempt_score:.2f} kcal/mol | RMSD = {attempt_rmsd:.2f} Å")
+    attempts.append(result)
+
+attempts.sort(key=lambda a: a[2])
+print(f"\n[*] All {N_ATTEMPTS} attempts ranked by guide score:")
+for i, a in enumerate(attempts):
+    a_rmsd = float(a[0].GetProp("FINAL_RMSD_TO_XTAL_A"))
+    print(f"    #{i + 1}: Score = {a[2]:.2f} kcal/mol | RMSD = {a_rmsd:.2f} Å")
+
+# 3b. Focused local Kin-PSO polish of ALL 5 attempts independently (not just
+# the single best-scored one) -- each attempt's own induced-fit receptor
+# conformation is used as that polish's receptor context. The best-scored
+# blind attempt isn't guaranteed to be the one nearest the true binding
+# mode; a lower-ranked but structurally distinct attempt can polish into a
+# better final pose. This does NOT fix an attempt that converged to
+# entirely the wrong region (local polish can't cross an energy barrier to
+# a different basin); it only helps whichever attempt(s) already landed
+# reasonably close.
+print(f"\n[*] Focused local Kin-PSO polish of all {N_ATTEMPTS} blind-docking attempts...")
+polished_candidates = []
+for i, (a_lig, a_rec_coords, a_score, _, _, _) in enumerate(attempts):
+    polish_rec_path = DEMO_DIR / f"_blind_polish_receptor_{i}.pdb"
+    unified_engine.rec_kin.write_pdb_frame(a_rec_coords, polish_rec_path)
+
+    polish_cavity = CavityDefinition.from_prm_file(DEMO_DIR / "cavity.prm")
+    polish_engine = DockingEngine(receptor_path=polish_rec_path, cavity=polish_cavity)
+    kin_polish_engine = KinematicDockingEngine(polish_engine, a_lig)
+    polish_pso = KinematicParticleSwarmOptimizer(kin_polish_engine)
+    polished_lig, polished_score, _ = polish_pso.run_pso(n_particles=20, n_iterations=20, ref_mol=xtal_mol)
+    polish_rec_path.unlink(missing_ok=True)
+
+    p_coords = polished_lig.GetConformer().GetPositions()
+    polished_rmsd = float(np.sqrt(np.mean(np.sum((p_coords - coords_xtal) ** 2, axis=1))))
+    final_mol, final_score_i, final_rmsd_i = (
+        (polished_lig, polished_score, polished_rmsd) if polished_score < a_score
+        else (a_lig, a_score, float(a_lig.GetProp("FINAL_RMSD_TO_XTAL_A")))
+    )
+    print(f"    Attempt #{i + 1} polished: Score = {final_score_i:.2f} kcal/mol | RMSD = {final_rmsd_i:.2f} Å")
+    polished_candidates.append((final_mol, final_score_i, final_rmsd_i, a_rec_coords))
+
+polished_candidates.sort(key=lambda c: c[1])
+best_lig, final_score, final_rmsd, best_rec_coords = polished_candidates[0]
+
+print(f"\n{'='*80}\nFINAL (best of {N_ATTEMPTS} polished attempts): "
+      f"{final_rmsd:.2f} Å RMSD to crystal, {final_score:.2f} kcal/mol\n{'='*80}")
+print("\nAll 5 polished candidates, ranked:")
+for i, (_, s, r, _) in enumerate(polished_candidates):
+    print(f"    #{i + 1}: Score = {s:.2f} kcal/mol | RMSD = {r:.2f} Å")
+
+lig_frames, rec_frames, blind_log = attempts[0][3], attempts[0][4], attempts[0][5]  # for the movie/plot below
 
 # 4. Plot Convergence Curve
 conv_png = DEMO_DIR / "blind_docking_convergence.png"
@@ -115,11 +198,21 @@ w_best.write(best_lig)
 w_best.close()
 unified_engine.rec_kin.write_pdb_frame(best_rec_coords, DEMO_DIR / "blind_docking_best_receptor.pdb")
 
-print(f"\n[✓] Saved Synchronized 600-Frame Blind Docking Trajectory:")
+# Save all 5 polished candidates together, for inspecting structural diversity
+w_top5 = Chem.SDWriter(str(DEMO_DIR / "blind_docking_top5_out.sdf"))
+for rank, (mol, s, r, _) in enumerate(polished_candidates):
+    mol.SetProp("_Name", f"A1CZZ_BlindAttempt_Rank{rank + 1}")
+    mol.SetProp("SCORE", f"{s:.3f}")
+    mol.SetProp("RMSD_TO_XTAL_A", f"{r:.3f}")
+    w_top5.write(mol)
+w_top5.close()
+
+print(f"\n[✓] Saved Synchronized 600-Frame Blind Docking Trajectory (attempt #1):")
 print(f"    • Swarm Movie   : {out_lig_movie.name}")
 print(f"    • Receptor Movie: {out_rec_movie.name}")
 print(f"    • Plot File     : blind_docking_convergence.png")
 print(f"    • Best Complex  : blind_docking_best_pose.sdf + blind_docking_best_receptor.pdb")
+print(f"    • Top-5 Poses   : blind_docking_top5_out.sdf")
 
 # 6. Generate PyMOL Script
 flex_res_str = " or ".join(f"(resi {r.res_num} and resn {r.res_name})" for r in unified_engine.rec_kin.flex_residues)

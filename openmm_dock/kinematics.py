@@ -16,6 +16,7 @@ from openmm import unit
 
 from .core import MolecularSystem, DockAtom, SDFParser
 from .engine import DockingEngine, DockingResult
+from .kinematic_utils import toroidal_diff, find_downstream_atoms, identify_rotatable_bonds
 
 
 @dataclass
@@ -44,18 +45,8 @@ class LigandKinematicTree:
         )
         
         # 2. Identify rotatable single bonds (excluding rings and terminal bonds)
-        rot_bond_smarts = Chem.MolFromSmarts("[!$(*#*)&!D1]-!@[!$(*#*)&!D1]")
-        rot_matches = self.mol.GetSubstructMatches(rot_bond_smarts)
-        
-        # Filter duplicate undirected matches (e.g. (1,2) and (2,1))
-        seen_pairs = set()
-        unique_matches = []
-        for a1, a2 in rot_matches:
-            pair = tuple(sorted([a1, a2]))
-            if pair not in seen_pairs:
-                seen_pairs.add(pair)
-                unique_matches.append((a1, a2))
-                
+        unique_matches = identify_rotatable_bonds(self.mol)
+
         # 3. Build directed tree joints and determine moving subtrees
         self.joints: List[TorsionJoint] = []
         for j_idx, (a1, a2) in enumerate(unique_matches):
@@ -81,18 +72,7 @@ class LigandKinematicTree:
 
     def _find_downstream_atoms(self, begin_idx: int, split_idx: int) -> List[int]:
         """Breadth-first search finding all atoms on the split_idx side of the cut."""
-        visited = {begin_idx, split_idx}
-        queue = [split_idx]
-        moving = [split_idx]
-        while queue:
-            curr = queue.pop(0)
-            for nbr in self.mol.GetAtomWithIdx(curr).GetNeighbors():
-                n_idx = nbr.GetIdx()
-                if n_idx not in visited:
-                    visited.add(n_idx)
-                    moving.append(n_idx)
-                    queue.append(n_idx)
-        return sorted(moving)
+        return find_downstream_atoms(self.mol, begin_idx, split_idx)
 
     def forward_kinematics(
         self,
@@ -281,7 +261,7 @@ class KinematicParticleSwarmOptimizer:
     @staticmethod
     def _toroidal_sub(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Calculates the shortest angular difference on the circle T^k."""
-        return np.arctan2(np.sin(a - b), np.cos(a - b))
+        return toroidal_diff(a, b)
 
     def run_pso(
         self,

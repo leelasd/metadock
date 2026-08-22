@@ -29,6 +29,7 @@ from openmm import unit
 
 from .engine import DockingEngine
 from .inverse_kinematics import TwoTierMacrocycleEngine
+from .kinematic_utils import toroidal_diff
 
 
 
@@ -307,7 +308,7 @@ class CollaborativeKinematicMetaDEngine:
 
     @staticmethod
     def _toroidal_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.arctan2(np.sin(a - b), np.cos(a - b))
+        return toroidal_diff(a, b)
 
     def compute_cvs(self, lig_coords: np.ndarray) -> Tuple[float, float, float, float]:
         """

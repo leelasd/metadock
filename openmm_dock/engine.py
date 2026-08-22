@@ -49,6 +49,8 @@ from .tether import (
     create_tether_restraint_force,
 )
 from .solvent import load_solvent_waters, create_solvent_tether_force
+from .kinematic_utils import find_downstream_atoms
+from .gradient_minimizer import lbfgs_minimize
 from .covalent import (
     CovalentRestraint,
     create_covalent_restraint,
@@ -80,6 +82,7 @@ def identify_torsion_dofs(ligand_mol: Chem.Mol) -> List[Dict[str, Any]]:
     that moves when the torsion is changed, plus a pair of reference atoms
     used to measure/set the absolute dihedral angle.
     """
+    num_atoms = ligand_mol.GetNumAtoms()
     dofs: List[Dict[str, Any]] = []
     for b in ligand_mol.GetBonds():
         if b.IsInRing() or b.GetBondTypeAsDouble() != 1.0:
@@ -89,19 +92,14 @@ def identify_torsion_dofs(ligand_mol: Chem.Mol) -> List[Dict[str, Any]]:
         if a1_atom.GetDegree() < 2 or a2_atom.GetDegree() < 2:
             continue
 
-        # BFS subtree of atoms on the a2 side of the bond (a2 inclusive, a1 excluded)
-        visited = {a1_idx}
-        queue = [a2_idx]
-        subtree: List[int] = []
-        while queue:
-            curr = queue.pop(0)
-            if curr in visited:
-                continue
-            visited.add(curr)
-            subtree.append(curr)
-            for nbr in ligand_mol.GetAtomWithIdx(curr).GetNeighbors():
-                if nbr.GetIdx() not in visited:
-                    queue.append(nbr.GetIdx())
+        # Subtree of atoms on the a2 side of the bond (a2 inclusive, a1 excluded).
+        # If that side holds more than half the atoms, rotate the smaller a1
+        # side instead (same physical dihedral, fewer atoms to transform).
+        subtree = find_downstream_atoms(ligand_mol, a1_idx, a2_idx)
+        if len(subtree) > num_atoms // 2:
+            a1_idx, a2_idx = a2_idx, a1_idx
+            a1_atom, a2_atom = a2_atom, a1_atom
+            subtree = find_downstream_atoms(ligand_mol, a1_idx, a2_idx)
 
         ref0 = next((n.GetIdx() for n in a1_atom.GetNeighbors() if n.GetIdx() != a2_idx), None)
         ref3 = next((n.GetIdx() for n in a2_atom.GetNeighbors() if n.GetIdx() != a1_idx), None)
@@ -246,6 +244,42 @@ def mutate_chromosome(
     if n_torsions > 0:
         noise[6:6 + n_torsions] = rng.normal(0.0, torsion_sigma, size=n_torsions)
     child[mut_mask] += noise[mut_mask]
+    return child
+
+
+def mutate_chromosome_vina_style(
+    rng: np.random.Generator,
+    chromosome: np.ndarray,
+    n_torsions: int,
+    trans_amplitude: float = 2.0,
+    rot_amplitude_deg: float = 60.0,
+) -> np.ndarray:
+    """
+    AutoDock Vina/smina-style coarse single-entity mutation (see mutate.cpp's
+    mutate_conf): picks exactly ONE of {translation, rotation, torsion_1, ...,
+    torsion_k} uniformly at random and applies one full-amplitude move to
+    just that entity, leaving every other gene untouched. This is
+    deliberately coarser and more localized than mutate_chromosome's
+    every-gene-at-once Gaussian jitter -- the coarseness is the point: paired
+    with an immediate local minimization (see dock_monte_carlo_minimization),
+    a single big jump followed by relaxation explores a genuinely different
+    basin each step, rather than a small perturbation of the current one.
+    """
+    child = chromosome.copy()
+    n_entities = 2 + n_torsions
+    which = int(rng.integers(0, n_entities))
+    if which == 0:
+        direction = rng.normal(size=3)
+        direction /= (np.linalg.norm(direction) + 1e-12)
+        mag = trans_amplitude * (rng.random() ** (1.0 / 3.0))
+        child[0:3] += direction * mag
+    elif which == 1:
+        axis = rng.normal(size=3)
+        axis /= (np.linalg.norm(axis) + 1e-12)
+        mag = rot_amplitude_deg * (rng.random() ** (1.0 / 3.0))
+        child[3:6] += axis * mag
+    else:
+        child[6 + (which - 2)] = rng.uniform(-180.0, 180.0)
     return child
 
 
@@ -1196,6 +1230,183 @@ class DockingEngine:
                             energy, chrom = lamarck(chrom)
 
                 best_coords = decode(chrom)
+                mol_variant = copy.deepcopy(ligand_mol)
+                vconf = mol_variant.GetConformer()
+                for i in range(lig_n):
+                    p = best_coords[i]
+                    vconf.SetAtomPosition(i, (float(p[0]), float(p[1]), float(p[2])))
+
+                report_context.setPositions(self._full_positions_from_coords(best_coords))
+                mm.LocalEnergyMinimizer.minimize(
+                    report_context,
+                    tolerance=0.1 * (unit.kilojoules_per_mole / unit.nanometer),
+                    maxIterations=500,
+                )
+                state = report_context.getState(getPositions=True, getEnergy=True)
+                scores = self._extract_decomposed_scores(report_context, mol_variant)
+                docked_mol = self._update_ligand_conformer(mol_variant, state.getPositions(), lig_start, lig_n)
+
+                for k, v in scores.items():
+                    docked_mol.SetProp(k, f"{v:.4f}")
+
+                results.append(
+                    DockingResult(
+                        mol=docked_mol,
+                        score=scores["SCORE"],
+                        scores=scores,
+                        run_idx=run + 1,
+                    )
+                )
+        finally:
+            del context, search_integrator
+            del report_context, report_integrator
+
+        results.sort(key=lambda r: r.score)
+        return results
+
+    def dock_monte_carlo_minimization(
+        self,
+        ligand_mol: Chem.Mol,
+        tether_constraints: Optional[List[TetherConstraint]] = None,
+        n_runs: int = 10,
+        num_steps: int = 30,
+        temperature: float = 1.2,
+        trans_amplitude: float = 2.0,
+        rot_amplitude_deg: float = 60.0,
+        lbfgs_maxiter: int = 15,
+        lbfgs_maxiter_final: int = 40,
+        seed: int = 42,
+    ) -> List[DockingResult]:
+        """
+        Monte-Carlo-with-Minimization (MCM / basin-hopping) docking, directly
+        modeled on AutoDock Vina/smina's core search loop (monte_carlo.cpp:
+        single_run -- mutate_conf, then quasi_newton BFGS minimize, THEN
+        Metropolis-accept the *minimized* energy, every single step).
+
+        This is a structurally different search than dock_simulated_annealing:
+        that method takes many small-Gaussian-jitter Metropolis steps and only
+        periodically (every lamarck_interval moves) locally minimizes, so most
+        visited states are raw, un-minimized proposal energies -- noisy
+        compared to a converged local optimum, and the chain can drift through
+        many similar-scoring-but-not-actually-relaxed poses before a Lamarckian
+        polish ever fires. Here every step is: one coarse single-DOF jump
+        (mutate_chromosome_vina_style) -> immediate local minimization via
+        lbfgs_minimize (gradient_minimizer.py's finite-difference L-BFGS-B,
+        operating on the same cheap grid-scored energy this class's other
+        search methods use) -> Metropolis test on the MINIMIZED energy. Every
+        state actually compared by the Markov chain is therefore already a
+        genuine local-basin minimum, which is the mechanistic reason Vina-
+        family tools converge to precise poses far more reliably than a
+        periodically-polished raw random walk: the search is over BASINS, not
+        over noisy raw conformations.
+
+        lbfgs_maxiter is deliberately small (mirrors Vina's cheap hunt_cap-
+        capped look-ahead minimize used to score every candidate); once a run
+        finishes, the single best chromosome found gets one more, fuller
+        lbfgs_maxiter_final pass (mirrors Vina's authentic_v full minimize)
+        before the final real decomposed-score report step.
+        """
+        rng = np.random.default_rng(seed)
+
+        if self.pharma_points and not tether_constraints:
+            ligand_mol = align_ligand_to_pharmacophore(ligand_mol, self.pharma_points)
+
+        ligand_mol, covalent_restraint = self._prepare_covalent(ligand_mol)
+
+        torsion_dofs = identify_torsion_dofs(ligand_mol)
+        n_t = len(torsion_dofs)
+
+        conf = ligand_mol.GetConformer()
+        base_coords = np.array([conf.GetAtomPosition(i) for i in range(ligand_mol.GetNumAtoms())])
+        base_local = base_coords - base_coords.mean(axis=0)
+
+        input_torsions = [
+            _dihedral_deg(base_coords[d["ref0"]], base_coords[d["a1"]], base_coords[d["a2"]], base_coords[d["ref3"]])
+            for d in torsion_dofs
+        ]
+        input_centroid_offset = base_coords.mean(axis=0) - self.cavity.center
+        input_chrom = np.concatenate([input_centroid_offset, [0.0, 0.0, 0.0], input_torsions])
+        guided = bool(self.pharma_points or tether_constraints or covalent_restraint is not None)
+
+        search_system, _, lig_start, lig_n = self._build_system(
+            ligand_mol, tether_constraints, covalent_restraint, fast_search="grid"
+        )
+        search_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        context = (
+            mm.Context(search_system, search_integrator, self.platform)
+            if self.platform
+            else mm.Context(search_system, search_integrator)
+        )
+
+        report_system, _, _, _ = self._build_system(
+            ligand_mol, tether_constraints, covalent_restraint, fast_search=False
+        )
+        report_integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
+        report_context = (
+            mm.Context(report_system, report_integrator, self.platform)
+            if self.platform
+            else mm.Context(report_system, report_integrator)
+        )
+
+        def decode(chrom: np.ndarray) -> np.ndarray:
+            return decode_chromosome(chrom, base_local, torsion_dofs, self.cavity.center)
+
+        def energy_of(chrom: np.ndarray) -> float:
+            coords = decode(chrom)
+            context.setPositions(self._full_positions_from_coords(coords))
+            return context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+
+        # Finite-difference step sizes: coarser for degrees than Angstroms,
+        # matching the very different natural scales of this chromosome.
+        step_vec = np.concatenate([
+            np.full(3, 0.02),                 # translation, Angstroms
+            np.full(3, 1.0),                  # euler angles, degrees
+            np.full(max(n_t, 0), 1.0),        # torsions, degrees
+        ])
+
+        def local_minimize(chrom: np.ndarray, maxiter: int) -> Tuple[np.ndarray, float]:
+            res = lbfgs_minimize(energy_of, chrom, step_size=step_vec, max_iterations=maxiter)
+            return res.x, res.fun
+
+        results: List[DockingResult] = []
+        try:
+            for run in range(n_runs):
+                if guided:
+                    chrom = mutate_chromosome(
+                        rng, input_chrom, mutation_rate=1.0, n_torsions=n_t,
+                        trans_sigma=0.5, rot_sigma=15.0, torsion_sigma=20.0,
+                    )
+                else:
+                    trans = rng.uniform(-1.5, 1.5, size=3)
+                    euler = ScipyRotation.random(random_state=rng).as_euler("xyz", degrees=True)
+                    chrom = np.concatenate([trans, euler, input_torsions])
+
+                # Mirrors monte_carlo.cpp's single_run exactly: one initial
+                # cheap minimize, num_steps of (coarse move -> cheap minimize
+                # -> Metropolis-accept-the-minimized-energy) tracking the best
+                # CHEAP-minimized chromosome seen, then ONE final, fuller
+                # "authentic" minimize on that best chromosome at the very
+                # end -- not a full re-minimize on every improvement, which
+                # is what made the first version of this method expensive
+                # without a matching accuracy benefit (Vina's own single_run
+                # only pays the expensive authentic_v minimize once per run).
+                chrom, energy = local_minimize(chrom, lbfgs_maxiter)
+                best_chrom, best_energy = chrom, energy
+
+                for _ in range(num_steps):
+                    candidate = mutate_chromosome_vina_style(
+                        rng, chrom, n_torsions=n_t,
+                        trans_amplitude=trans_amplitude, rot_amplitude_deg=rot_amplitude_deg,
+                    )
+                    candidate, cand_energy = local_minimize(candidate, lbfgs_maxiter)
+
+                    if cand_energy <= energy or rng.random() < math.exp(-(cand_energy - energy) / max(temperature, 1e-6)):
+                        chrom, energy = candidate, cand_energy
+                        if energy < best_energy:
+                            best_chrom, best_energy = chrom, energy
+
+                best_chrom, best_energy = local_minimize(best_chrom, lbfgs_maxiter_final)
+                best_coords = decode(best_chrom)
                 mol_variant = copy.deepcopy(ligand_mol)
                 vconf = mol_variant.GetConformer()
                 for i in range(lig_n):

@@ -21,6 +21,7 @@ import openmm as mm
 from openmm import unit
 
 from .unified_kinematic_pso import UnifiedKinematicPSOEngine
+from .kinematic_utils import toroidal_diff
 
 
 @dataclass
@@ -280,23 +281,23 @@ class GeneralizedCVMetadynamicsEngine:
                 p["v_t"] = w * p["v_t"] + c1 * r1 * (p["p_best_t"] - p["t"]) + c2 * r2 * (g_best_t - p["t"]) + push_t
                 p["t"] += np.clip(p["v_t"], -0.3, 0.3)
                 
-                diff_r_p = np.arctan2(np.sin(p["p_best_r"] - p["r"]), np.cos(p["p_best_r"] - p["r"]))
-                diff_r_g = np.arctan2(np.sin(g_best_r - p["r"]), np.cos(g_best_r - p["r"]))
+                diff_r_p = toroidal_diff(p["p_best_r"], p["r"])
+                diff_r_g = toroidal_diff(g_best_r, p["r"])
                 p["v_r"] = w * p["v_r"] + c1 * r1 * diff_r_p + c2 * r2 * diff_r_g
                 p["r"] = (p["r"] + np.clip(p["v_r"], -0.2, 0.2) + np.pi) % (2 * np.pi) - np.pi
-                
-                diff_ring_p = np.arctan2(np.sin(p["p_best_ring"] - p["ring"]), np.cos(p["p_best_ring"] - p["ring"]))
-                diff_ring_g = np.arctan2(np.sin(g_best_ring - p["ring"]), np.cos(g_best_ring - p["ring"]))
+
+                diff_ring_p = toroidal_diff(p["p_best_ring"], p["ring"])
+                diff_ring_g = toroidal_diff(g_best_ring, p["ring"])
                 p["v_ring"] = w * p["v_ring"] + c1 * r1 * diff_ring_p + c2 * r2 * diff_ring_g
                 p["ring"] = (p["ring"] + np.clip(p["v_ring"], -0.15, 0.15) + np.pi) % (2 * np.pi) - np.pi
-                
-                diff_exo_p = np.arctan2(np.sin(p["p_best_exo"] - p["exo"]), np.cos(p["p_best_exo"] - p["exo"]))
-                diff_exo_g = np.arctan2(np.sin(g_best_exo - p["exo"]), np.cos(g_best_exo - p["exo"]))
+
+                diff_exo_p = toroidal_diff(p["p_best_exo"], p["exo"])
+                diff_exo_g = toroidal_diff(g_best_exo, p["exo"])
                 p["v_exo"] = w * p["v_exo"] + c1 * r1 * diff_exo_p + c2 * r2 * diff_exo_g
                 p["exo"] = (p["exo"] + np.clip(p["v_exo"], -0.2, 0.2) + np.pi) % (2 * np.pi) - np.pi
-                
-                diff_rec_p = np.arctan2(np.sin(p["p_best_rec"] - p["rec"]), np.cos(p["p_best_rec"] - p["rec"]))
-                diff_rec_g = np.arctan2(np.sin(g_best_rec - p["rec"]), np.cos(g_best_rec - p["rec"]))
+
+                diff_rec_p = toroidal_diff(p["p_best_rec"], p["rec"])
+                diff_rec_g = toroidal_diff(g_best_rec, p["rec"])
                 p["v_rec"] = w * p["v_rec"] + c1 * r1 * diff_rec_p + c2 * r2 * diff_rec_g
                 p["rec"] = (p["rec"] + np.clip(p["v_rec"], -0.1, 0.1) + np.pi) % (2 * np.pi) - np.pi
                 

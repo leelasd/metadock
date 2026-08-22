@@ -25,6 +25,7 @@ from openmm import unit
 from .unified_kinematic_pso import UnifiedKinematicPSOEngine
 from .generalized_cv import GeneralizedCVEngine
 from .metadynamics import VisitedBasin
+from .kinematic_utils import toroidal_diff
 
 
 @dataclass
@@ -77,7 +78,7 @@ class GlobalBlindDockingEngine:
 
     @staticmethod
     def _toroidal_sub(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.arctan2(np.sin(a - b), np.cos(a - b))
+        return toroidal_diff(a, b)
 
     def generate_conformer_seeds(self, mol: Chem.Mol, num_seeds: int = 6) -> List[np.ndarray]:
         """Generates diverse 3D macrocyclic ring conformer seeds centered at pocket centroid."""

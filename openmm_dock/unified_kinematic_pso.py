@@ -20,6 +20,8 @@ from openmm import unit
 from .engine import DockingEngine
 from .inverse_kinematics import TwoTierMacrocycleEngine
 from .receptor_kinematics import ReceptorSideChainKinematics
+from .scoring import ScoreWeights
+from .kinematic_utils import toroidal_diff
 
 
 @dataclass
@@ -60,7 +62,8 @@ class UnifiedKinematicPSOEngine:
         receptor_pdb_path: Path | str,
         pocket_center: np.ndarray,
         ligand_mol: Chem.Mol,
-        flex_radius: float = 9.0
+        flex_radius: float = 9.0,
+        weights: Optional[ScoreWeights] = None
     ):
         self.lig_mol = Chem.Mol(ligand_mol)
         self.two_tier_lig = TwoTierMacrocycleEngine(ligand_mol)
@@ -85,7 +88,7 @@ class UnifiedKinematicPSOEngine:
         self.num_rec_chi = len(self.all_chi_keys)
         
         # OpenMM Docking Engine
-        self.engine = DockingEngine(receptor_path=receptor_pdb_path)
+        self.engine = DockingEngine(receptor_path=receptor_pdb_path, weights=weights)
         self.system, _, self.lig_start, self.lig_n = self.engine._build_system(self.lig_mol)
         self.integrator = mm.VerletIntegrator(1.0 * unit.femtoseconds)
         self.context = (
@@ -101,7 +104,7 @@ class UnifiedKinematicPSOEngine:
 
     @staticmethod
     def _toroidal_sub(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return np.arctan2(np.sin(a - b), np.cos(a - b))
+        return toroidal_diff(a, b)
 
     def evaluate_coupled_state(
         self,
