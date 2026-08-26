@@ -74,8 +74,20 @@ class GSOParameters:
     initial_vision_range: float = 10.0  # Angstroms (translation-distance neighbor metric)
     max_vision_range: float = 40.0      # Angstroms
     max_neighbors: int = 6
-    step_translation: float = 0.6       # Angstroms per move
-    step_rotation_deg: float = 8.0      # degrees per move
+    # Fractional interpolation steps (0-1), NOT absolute Angstroms/degrees --
+    # matching LightDock's real semantics (constants.py: DEFAULT_TRANSLATION_STEP
+    # "Interpolation step for translation (in %)", DEFAULT_ROTATION_STEP
+    # "Normalized SLERP step. 1 means full jump, 0 means no movement"). An
+    # earlier version of this class used step_translation as a small FIXED
+    # 0.6 A per-move distance -- with a genuinely blind swarm starting
+    # 20-80 A from native and only 30-50 steps, that caps total possible
+    # travel at ~18-30 A, physically unable to reach the interface from most
+    # starting positions regardless of how many glowworms or steps are used.
+    # This was the real root cause of the premature-convergence-onto-a-
+    # weak-basin behavior seen in testing, not (only) the synchronous-
+    # update ordering bug fixed separately in GlowwormSwarmOptimizer.run.
+    step_translation_frac: float = 0.5  # fraction of the gap to the chosen neighbor
+    step_rotation_frac: float = 0.5     # fraction of the angular gap (SLERP)
 
 
 @dataclass
@@ -118,6 +130,82 @@ def generate_surface_swarm_centers(
     z = np.cos(phi)
     unit_points = np.stack([x, y, z], axis=1)
     return center + unit_points * swarm_radius
+
+
+def _farthest_point_sampling(points: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarray:
+    """Greedy max-min-distance downsampling to k well-spread points."""
+    n = len(points)
+    if k >= n:
+        return points
+    selected = [int(rng.integers(0, n))]
+    dists = np.linalg.norm(points - points[selected[0]], axis=1)
+    for _ in range(k - 1):
+        next_idx = int(np.argmax(dists))
+        selected.append(next_idx)
+        dists = np.minimum(dists, np.linalg.norm(points - points[next_idx], axis=1))
+    return points[selected]
+
+
+def generate_sasa_swarm_centers(
+    receptor_pdb: str,
+    n_swarms: int,
+    ligand_radius: float,
+    surface_offset: float = 3.0,
+    min_atom_sasa: float = 1.0,
+    seed: int = 42,
+) -> np.ndarray:
+    """
+    Real SASA-derived swarm placement, replacing generate_surface_swarm_centers's
+    Fibonacci-sphere bounding-sphere approximation (see
+    protein_protein_1brs/DOCUMENTATION.md section 8.4 -- that approximation
+    was diagnosed, via ablation, as the actual bottleneck behind our GSO's
+    weaker blind-docking performance relative to real LightDock, which
+    NOT a difference in per-swarm search sophistication).
+
+    Uses the freesasa package (a real, independent SASA calculator, not
+    LightDock's own implementation) to compute per-atom solvent-accessible
+    surface area on the receptor, keeps only atoms with meaningfully
+    nonzero SASA (min_atom_sasa, in A^2), and places one candidate point per
+    exposed atom along that atom's own outward radial direction (from the
+    receptor centroid), offset past its van der Waals radius by the mobile
+    partner's own radius plus a contact gap -- so candidate points hug the
+    TRUE molecular surface shape instead of a sphere. Candidates are then
+    downselected to n_swarms well-spread points via greedy farthest-point
+    sampling, so swarms don't cluster redundantly on the most convex parts
+    of the surface.
+
+    This is not a reimplementation of LightDock's own point-generation
+    algorithm (their "surface density" + "incompatible filter" + "interior
+    points filter" pipeline) -- it's an independent approach solving the
+    same underlying problem (candidate points distributed over the true
+    accessible surface, not a bounding sphere) using a different, real SASA
+    library.
+    """
+    import freesasa
+
+    structure = freesasa.Structure(str(receptor_pdb))
+    result = freesasa.calc(structure)
+    n_atoms = structure.nAtoms()
+
+    coords = np.array([structure.coord(i) for i in range(n_atoms)])
+    receptor_center = coords.mean(axis=0)
+
+    candidates = []
+    for i in range(n_atoms):
+        if result.atomArea(i) <= min_atom_sasa:
+            continue
+        coord = coords[i]
+        radius = structure.radius(i)
+        outward = coord - receptor_center
+        norm = np.linalg.norm(outward)
+        if norm < 1e-6:
+            continue
+        outward /= norm
+        candidates.append(coord + outward * (radius + ligand_radius + surface_offset))
+
+    candidates = np.array(candidates)
+    rng = np.random.default_rng(seed)
+    return _farthest_point_sampling(candidates, n_swarms, rng)
 
 
 def _distance_bonded_pairs(coords: np.ndarray, cutoff: float = 1.7) -> List[Tuple[int, int]]:
@@ -254,30 +342,44 @@ class GlowwormSwarmOptimizer:
                 brightness = -g.energy
                 g.luciferin = (1.0 - p.rho) * g.luciferin + p.gamma * brightness
 
-            for g in glowworms:
+            # Snapshot every glowworm's (trans, quat, luciferin) BEFORE any
+            # movement this step, and compute every neighbor search / move
+            # target against that fixed snapshot -- matching LightDock's
+            # real algorithm.py, which does a full update_luciferin pass,
+            # THEN a full movement_phase pass, never interleaved. An earlier
+            # version of this method mutated g.trans/g.quat in place while
+            # still iterating the same glowworms list, so a glowworm late in
+            # the loop could see some neighbors already moved this step and
+            # others not -- an order-dependent artifact that plausibly
+            # caused the premature, over-fast convergence onto a single
+            # basin observed in early testing (see
+            # protein_protein_1brs/DOCUMENTATION.md).
+            snapshot = [(g.trans.copy(), g.quat.copy(), g.luciferin) for g in glowworms]
+
+            for g, (g_trans, g_quat, g_luciferin) in zip(glowworms, snapshot):
                 vr2 = g.vision_range ** 2
                 neighbors = [
-                    o for o in glowworms
+                    (o_trans, o_quat, o_luciferin)
+                    for o, (o_trans, o_quat, o_luciferin) in zip(glowworms, snapshot)
                     if o.glowworm_id != g.glowworm_id
-                    and o.luciferin > g.luciferin
-                    and float(np.sum((o.trans - g.trans) ** 2)) < vr2
+                    and o_luciferin > g_luciferin
+                    and float(np.sum((o_trans - g_trans) ** 2)) < vr2
                 ]
                 if neighbors:
-                    diffs = np.array([o.luciferin - g.luciferin for o in neighbors])
+                    diffs = np.array([n_luciferin - g_luciferin for _, _, n_luciferin in neighbors])
                     probs = diffs / diffs.sum()
-                    chosen = neighbors[rng.choice(len(neighbors), p=probs)]
+                    chosen_trans, chosen_quat, _ = neighbors[rng.choice(len(neighbors), p=probs)]
 
-                    direction = chosen.trans - g.trans
-                    dist = np.linalg.norm(direction)
-                    if dist > 1e-9:
-                        g.trans = g.trans + (direction / dist) * min(p.step_translation, dist)
+                    # Move a FRACTION of the gap to the chosen neighbor (not a
+                    # fixed absolute step) -- see GSOParameters.step_translation_frac
+                    # docstring for why this matters at genuinely blind range.
+                    g.trans = g_trans + (chosen_trans - g_trans) * p.step_translation_frac
 
                     key_rot, _ = ScipyRotation.align_vectors(
-                        ScipyRotation.from_quat(chosen.quat).apply(np.eye(3)),
-                        ScipyRotation.from_quat(g.quat).apply(np.eye(3)),
+                        ScipyRotation.from_quat(chosen_quat).apply(np.eye(3)),
+                        ScipyRotation.from_quat(g_quat).apply(np.eye(3)),
                     )
-                    slerp_frac = min(1.0, p.step_rotation_deg / max(1e-6, key_rot.magnitude() * 180.0 / np.pi))
-                    g.quat = (ScipyRotation.from_rotvec(key_rot.as_rotvec() * slerp_frac) * ScipyRotation.from_quat(g.quat)).as_quat()
+                    g.quat = (ScipyRotation.from_rotvec(key_rot.as_rotvec() * p.step_rotation_frac) * ScipyRotation.from_quat(g_quat)).as_quat()
 
                     n_found = len(neighbors)
                 else:

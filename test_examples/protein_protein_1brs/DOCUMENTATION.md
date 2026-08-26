@@ -218,23 +218,200 @@ outcome for a same-session build, not a surprising one.
 
 ---
 
-## 8. Known limitations / what would need work to close the gap
+## 8. Follow-up investigation: production scale and DFIRE scoring
 
+Two direct questions this section answers: *why not implement LightDock's
+own scoring function*, and *why not test at the scale that actually matters*.
+Both were legitimate gaps in §7 — the 20-swarm comparison there was cheap
+and fast, not representative.
+
+### 8.1. LightDock's DFIRE as a real, callable scoring backend
+
+DFIRE is a knowledge-based statistical potential (atom-type-pair energies
+binned by distance, from PDB structure statistics), not a physics force
+field term — it can't be expressed as an analytic LJ/Coulomb expression, but
+it doesn't need to be reimplemented either: LightDock's own installed
+package exposes it as an ordinary importable Python/Cython API
+(`lightdock.scoring.dfire.driver.DFIRE`, `DFIREAdapter`,
+`lightdock.prep.simulation.read_input_structure`). `openmm_dock/lightdock_dfire_scoring.py`
+wraps this as a `(trans, quat) -> energy` closure compatible with
+`GlowwormSwarmOptimizer` — calling their installed package as an external
+library dependency (same as depending on scipy/numpy), not copying their
+GPLv3 code into this repository. Sanity-checked correct: native pose scores
+-25.7 (favorable) vs. -4.7 for a fully separated pose. Per-eval cost turned
+out to be ~10.7 ms — *slower* than our own OpenMM scoring's ~2.7 ms; real
+LightDock's production throughput comes from multiprocessing across cores
+(their `-c` flag), not raw single-eval speed.
+
+### 8.2. Production-scale real LightDock (partial run, real numbers)
+
+Ran `lightdock3_setup.py -s 400 -g 200` (LightDock's own documented
+`DEFAULT_NUM_SWARMS`/`DEFAULT_NUM_GLOWWORMS`, i.e. genuinely their
+production default, not an arbitrary choice) + `lightdock3.py setup.json 50
+-s dfire -c 12` in `lightdock_run_production/`. The process was killed by
+something external to this investigation partway through, at **206/400
+swarms (52%) fully complete** — `lgd_rank.py 400 50` handles this
+gracefully (skips missing swarms with a warning, ranks what exists).
+
+**Result: the top-ranked pose (swarm 215) came in at 1.97–2.30 Å RMSD to
+native** (5 top glowworms in that swarm, all 1.97–2.30 Å) — a dramatic jump
+from the 20-swarm comparison's 12.63 Å best. This is the single most
+important number in this document: **the earlier "LightDock wins" framing
+was really "LightDock's under-sampled run beat our under-sampled run,"
+which is a much weaker and less interesting claim.** At real production
+scale, real LightDock gets close to native.
+
+### 8.3. Ablation: does OUR search algorithm close the gap at matching scale?
+
+Two real bugs were found and fixed in `GlowwormSwarmOptimizer.run` before
+this test:
+
+1. **Synchronous update.** The movement phase mutated `g.trans`/`g.quat` in
+   place while still iterating the same `glowworms` list, so a glowworm late
+   in a step's loop could see some neighbors already moved that step and
+   others not — an order-dependent artifact, not LightDock's real
+   synchronous "evaluate all, then move all" structure. Fixed by snapshotting
+   every glowworm's `(trans, quat, luciferin)` before any movement each step.
+2. **Wrong step-size semantics (the bigger one).** `GSOParameters.step_translation`
+   was a small *fixed* 0.6 Å absolute distance per move. LightDock's real
+   `DEFAULT_TRANSLATION_STEP`/`DEFAULT_ROTATION_STEP` (constants.py) are
+   documented as **interpolation fractions** — "0.5 means jump 50% of the
+   way to the target," not an absolute distance. With a genuinely blind
+   swarm spanning 23–77 Å from native (median 55 Å) and only 30 steps, a
+   fixed 0.6 Å step caps total possible travel at ~18 Å — physically unable
+   to reach the interface from most starting positions, regardless of how
+   many glowworms or steps are used. Fixed by replacing the fixed step with
+   `step_translation_frac`/`step_rotation_frac` (fractional interpolation
+   toward the chosen neighbor, matching LightDock's real mechanism).
+
+Both fixes are real and worth keeping. **Neither closed the gap.** Same
+scale (100 swarms × 50 glowworms × 30 steps) both before and after, all four
+results plateau in the same ~21–51 Å band, regardless of scoring function:
+
+| Configuration | Best-by-score RMSD | Best RMSD anywhere in swarm |
+|---|---|---|
+| Our GSO + DFIRE, buggy fixed 0.6 Å step | 44.16 Å | 21.63 Å |
+| Our GSO + DFIRE, fixed fractional step | 46.82 Å | 24.98 Å |
+| Our GSO + OpenMM physics, fixed fractional step | 51.35 Å | 23.43 Å |
+| Real LightDock, 20-swarm scale | 39.4 Å | 12.63 Å |
+| **Real LightDock, ~52%-complete production scale** | **1.97–2.30 Å** | — |
+
+Swapping scoring functions (DFIRE vs. our OpenMM physics) made no
+meaningful difference either (46.82 Å vs. 51.35 Å, both worse than either
+tiny-scale run) — ruling out "untuned scoring weights" as the dominant
+factor too.
+
+### 8.4. Actual diagnosis: coverage density, not search sophistication
+
+`GlowwormSwarmOptimizer`'s `vision_range` starts at 10 Å and grows by at
+most `beta * max_neighbors ≈ 0.08 * 6 ≈ 0.5` Å/step, reaching at most
+`10 + 30*0.5 = 25` Å after 30 steps — nowhere near enough to bridge the
+tens-of-Angstrom gaps between different swarm centers placed all around a
+~40 Å-radius receptor. In practice this means **a glowworm essentially
+never finds a "neighbor" outside its own originating swarm's initial ~2 Å
+jitter cluster** — cross-swarm information exchange (the mechanism that
+would make GSO a genuinely *unified* global search rather than N independent
+local ones) basically doesn't happen within any tractable step budget. Each
+swarm just polishes toward whichever local optimum sits nearest its own
+starting point, completely independent of every other swarm.
+
+That reframes the entire investigation: **whether a blind run finds the
+interface comes down almost entirely to whether any single swarm's starting
+position happens to be well-placed** — a question of *swarm placement
+density and quality*, not within-swarm optimizer sophistication. Real
+LightDock's win was never really about a better search algorithm; it was
+**4x the swarm count (400 vs. our 100) placed on a true SASA-derived surface
+instead of our Fibonacci-sphere bounding-sphere approximation** — swarm 215
+almost certainly started in a favorable spot purely from denser, better-
+targeted coverage, and its own local GSO polish did the rest. This is
+consistent with, and now directly explains, the coverage-density hypothesis
+already listed in §7's diagnosis (item 3) — the ablations in §8.3 upgrade it
+from "one of three plausible factors" to "the actual explanation," since
+fixing the other two (scoring weights, search-loop bugs) provably didn't move
+the result.
+
+**The concrete, well-scoped next step, if pursued**: replace
+`generate_surface_swarm_centers`'s Fibonacci-sphere approximation with a real
+SASA-based placement (the `freesasa` package is already installed) and/or
+simply increase `N_SWARMS` to matching scale (400) — either should
+directly test this diagnosis, unlike the scoring-function and step-size
+changes already ruled out above.
+
+### 8.5. Testing the diagnosis directly: real SASA placement at matching scale
+
+Implemented `generate_sasa_swarm_centers` in `glowworm_swarm.py`: uses the
+`freesasa` package (a real, independent SASA calculator — not a port of
+LightDock's own point-generation code) to compute per-atom solvent-accessible
+surface area on the receptor, keeps atoms with meaningfully nonzero SASA,
+places one candidate point per exposed atom along that atom's own outward
+radial direction (offset past its van der Waals radius by the mobile
+partner's radius + a contact gap), then downselects to `N_SWARMS`
+well-spread points via greedy farthest-point sampling. This hugs the true,
+non-spherical molecular surface instead of a bounding sphere — confirmed by
+inspection: candidate-derived swarm centers ranged 26.3–48.7 Å from the
+receptor centroid (vs. the Fibonacci sphere's single fixed radius).
+
+Ran at `N_SWARMS=400` (matching LightDock's own default swarm count) ×
+`N_PER_SWARM=50` × 30 steps, OpenMM scoring (not DFIRE — already shown in
+§8.3 not to matter, and ~4x cheaper per-eval). This run took **204.7
+minutes** (vs. ~27 min estimated) — much slower than expected, plausibly
+because SASA-placed swarms sit in genuinely contact-dense regions near the
+real surface, giving OpenMM's cutoff-based neighbor list far more atom pairs
+to evaluate per energy call than the old sparse fixed-radius sphere ever did.
+
+**Result: 29.74 Å best-by-score, 17.41 Å best RMSD found anywhere in the
+final swarm.** Initial swarm coverage was measurably better too — RMSD
+range 9.4–74.1 Å (median 48.2 Å) vs. the Fibonacci sphere's 23.4–76.8 Å
+(median 55.2 Å); the closest starting swarm got within 9.4 Å of native,
+something the old placement never achieved.
+
+**This partially confirms, but does not complete, the coverage-density
+diagnosis.** Compared to the 100-swarm Fibonacci baseline (51.35 Å OpenMM /
+46.82 Å DFIRE), real SASA placement at 4x the swarm count is a genuine,
+substantial improvement — roughly halving the best-anywhere RMSD (46–51 Å
+→ 17–30 Å). But it falls well short of closing the gap to real LightDock's
+1.97–2.30 Å production result. Two honest possibilities, not yet
+distinguished: (a) LightDock's own point generation is qualitatively better
+than this independent SASA approach — their pipeline evaluates 602–786
+candidate points before filtering (via an "incompatible filter" and
+"interior points filter" this implementation doesn't replicate) rather than
+placing exactly one point per exposed atom; or (b) their 200
+glowworms/swarm (4x this run's 50) gives meaningfully more thorough
+per-swarm local refinement once a swarm *does* start near the interface —
+consistent with the observation here that the single best-*starting* swarm
+(9.4 Å) did not end up producing the best *final* pose (17.41 Å came from a
+different swarm), suggesting the within-swarm search itself may still be
+leaving refinement on the table even from a good start. Given this run
+alone took 3.4 hours, a direct 200-glowworms/swarm test to distinguish these
+two remaining hypotheses was not pursued in this session.
+
+## 9. Known limitations / what would need work to close the gap
+
+- **Residual gap after the swarm-placement fix (§8.5)**: real SASA placement
+  at matching scale roughly halved the best-anywhere RMSD (46–51 Å → 17–30 Å)
+  but did not close the gap to LightDock's 1.97–2.30 Å. Two undistinguished
+  remaining hypotheses: LightDock's own candidate-filtering pipeline
+  (interior-points/incompatible filters, 602–786 candidates evaluated) may
+  place points more precisely than this one-point-per-exposed-atom approach;
+  or their 4x-larger 200-glowworms/swarm search may extract meaningfully more
+  from a good starting position than this implementation's 50/swarm does.
 - **No ANM normal-mode flexibility** for either partner (LightDock's `-anm`
   flag) — both partners are treated as fully rigid.
-- **Synchronous update**: fix the sequential-move-order issue in
-  `GlowwormSwarmOptimizer.run` identified in §7.2 — evaluate/update
-  luciferin for the whole swarm first, snapshot positions, then move
-  everyone against that snapshot.
-- **True surface-based swarm placement**: replace the Fibonacci-sphere
-  approximation with a real SASA calculation (the `freesasa` package is
-  already installed in this environment).
+- **No cross-swarm information exchange mechanism** — even with correct
+  swarm placement, GSO's own vision-range growth is too slow to unify
+  separate swarms into one coordinated search (see §8.4). LightDock accepts
+  this too (it's inherent to the algorithm); it compensates entirely via
+  swarm placement density, not algorithmic fix.
 - **Interface-specific scoring weights**: re-tune `ScoreWeights` (or add a
   dedicated protein-protein weight profile) against a proper benchmark set
-  rather than reusing the small-molecule defaults unchanged.
+  rather than reusing the small-molecule defaults unchanged — lower priority
+  now that §8.3 showed scoring function choice isn't the dominant factor.
 - **Clustering/reranking**: LightDock's real pipeline clusters nearby poses
   (`lgd_cluster_bsas.py`) and reports cluster representatives, not raw
   per-glowworm ranks — our demo reports raw glowworms only.
+- **SASA-placed runs are slow**: per-eval cost rises substantially near the
+  true surface (§8.5) — worth profiling/optimizing before attempting the
+  200-glowworms/swarm test above.
 
 ## Files in this directory
 
@@ -244,7 +421,9 @@ outcome for a same-session build, not a surprising one.
 | `extract_chains.py` | Splits out chain A/D + builds `native_complex_AD.pdb` |
 | `barnase_receptor.pdb`, `barstar_ligand.pdb` | Extracted receptor/ligand chains |
 | `native_complex_AD.pdb` | Ground-truth bound complex (untouched crystal frame) |
-| `run_gso_docking_demo.py` | Our own GSO protein-protein docking demo |
+| `run_gso_docking_demo.py` | Our own GSO protein-protein docking demo (20-swarm scale) |
+| `run_gso_scaled_demo.py` | Parametrized (env vars: `SCORING`, `SWARM_METHOD`, `N_SWARMS`, `N_PER_SWARM`, `N_STEPS`) version used for the §8 ablations |
+| `lightdock_run_production/` | Real LightDock at production-scale settings (400×200, 52% complete) |
 | `compare_rmsd.py` | Frame-offset-corrected RMSD calculator (works for either tool's output) |
 | `lightdock_run/` | Real LightDock setup + simulation working directory |
 | `lightdock_sim.log` | Real LightDock's simulation stdout/stderr |

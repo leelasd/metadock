@@ -4,7 +4,7 @@ A GPU-accelerated molecular docking, scoring, and pose minimization framework im
 
 This package ports the scoring philosophy and features of [rDock (RiboDock)](https://github.com/CBDD/rDock) into OpenMM custom forces and integrators, supporting proteins, nucleic acids (RNA/DNA), explicit flexible solvent, pharmacophore constraints, and template-based tethered docking.
 
-Detailed architectural deep-dive: See [docs/TECHNICAL_DEEPDIVE.md](docs/TECHNICAL_DEEPDIVE.md).
+Detailed architectural deep-dive (the scoring engine, kinematics, every search algorithm — simulated annealing, genetic algorithm, Monte Carlo, Vina-style basin hopping, PSO, blind docking, metadynamics, Bayesian/gradient optimization — protein-protein GSO docking, and every supporting module) covering the entire `openmm_dock` package module-by-module: See [docs/TECHNICAL_DEEPDIVE.md](docs/TECHNICAL_DEEPDIVE.md).
 
 ---
 

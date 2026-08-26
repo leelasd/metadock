@@ -56,3 +56,12 @@ test_examples/*/*_movie.pdb
 
 # graphify indexing output (regenerable, see /graphify skill)
 graphify-out/
+
+# LightDock production-scale run output (92 MB, ~1900 regenerable files --
+# raw pose/checkpoint data from a 400-swarm run; exact regeneration commands
+# are documented in test_examples/protein_protein_1brs/DOCUMENTATION.md
+# section 8.2. The small-scale lightdock_run/ comparison directory and the
+# summary lightdock_production_sim.log are kept -- only the bulky raw
+# per-swarm output is excluded, matching this file's existing policy on
+# large regenerable trajectory/movie output above.)
+test_examples/protein_protein_1brs/lightdock_run_production/
