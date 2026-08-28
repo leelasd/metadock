@@ -89,6 +89,84 @@ class DockAtom:
         return 0.40  # default kJ/mol
 
 
+def _perceive_bonds_by_distance(atoms: List["DockAtom"], cutoff: float = 1.7) -> List["DockBond"]:
+    """
+    Simple distance-based bond perception for parsers (PDBParser) that don't
+    get explicit connectivity from their source file: any atom pair closer
+    than `cutoff` Angstroms is treated as bonded. Used only to recover
+    accurate is_donor flags (need to know which N/O/S atoms have a real
+    bonded H) -- not a general-purpose topology (no bond order/rotatability
+    is inferred from it).
+    """
+    coords = np.array([a.coord for a in atoms])
+    n = len(atoms)
+    bonds: List[DockBond] = []
+    for i in range(n):
+        d2 = np.sum((coords[i + 1:] - coords[i]) ** 2, axis=1)
+        close = np.nonzero(d2 < cutoff ** 2)[0]
+        for c in close:
+            bonds.append(DockBond(atom1=i, atom2=i + 1 + int(c), order="1"))
+    return bonds
+
+
+# Standard amino acid sidechain donor atom names, for structures with no
+# explicit hydrogens at all (a common case for a raw, unprotonated
+# receptor.pdb) -- bond-based detection can never find a donor when the H
+# atom simply isn't in the file, so this is a real fallback, not a
+# duplicate check. Backbone amide N is a donor for every residue except
+# proline (its ring nitrogen is a secondary/tertiary amine with no N-H).
+# HIS includes both ND1 and NE2 since tautomer state (which one is
+# protonated) isn't resolved from heavy-atom coordinates alone.
+_PROLINE_RESIDUES = {"PRO"}
+_SIDECHAIN_DONOR_ATOMS: Dict[str, Tuple[str, ...]] = {
+    "SER": ("OG",), "THR": ("OG1",), "CYS": ("SG",), "TYR": ("OH",),
+    "ASN": ("ND2",), "GLN": ("NE2",), "LYS": ("NZ",),
+    "ARG": ("NE", "NH1", "NH2"), "HIS": ("ND1", "NE2"), "TRP": ("NE1",),
+}
+
+
+def _assign_standard_residue_donor_fallback(atoms: List["DockAtom"]) -> None:
+    """Sets is_donor=True for known standard-amino-acid donor atoms
+    (backbone amide N, defined sidechain donors) WITHOUT requiring an
+    explicit bonded H -- see module comment above. Only ever turns a flag
+    ON, never off, so it's safe to run after (or instead of) the bond-based
+    pass: a structure that DOES have real H atoms keeps that more precise
+    signal; one that doesn't still gets correct standard-chemistry donors
+    instead of silently reporting zero."""
+    for a in atoms:
+        if a.name.strip().upper() == "N" and a.residue_name.strip().upper() not in _PROLINE_RESIDUES:
+            a.is_donor = True
+        elif a.name.strip().upper() in _SIDECHAIN_DONOR_ATOMS.get(a.residue_name.strip().upper(), ()):
+            a.is_donor = True
+
+
+def _assign_donor_flags_from_bonds(atoms: List["DockAtom"], bonds: List["DockBond"]) -> None:
+    """
+    Overwrites each atom's is_donor flag based on REAL bonded connectivity
+    (does this N/O/S atom have an attached hydrogen?) instead of a fragile
+    heuristic based on the atom's own name/sybyl-type string containing the
+    literal letter "H" -- which silently misses, for example, every
+    backbone amide N (PDB atom name is just "N", not "NH") despite it being
+    the single most common hydrogen-bond donor in any protein, and every
+    ligand atom whose hydrogens were added as explicit graph neighbors
+    (same underlying bug class as the GetTotalNumHs() vs.
+    GetTotalNumHs(includeNeighbors=True) fix already applied in
+    pharmacophore.py's find_ligand_pharma_features -- here duplicated
+    independently in three different from-scratch parsers rather than
+    shared code, so each needed its own fix). Mutates atoms in place.
+    """
+    has_h_neighbor = [False] * len(atoms)
+    for b in bonds:
+        a1, a2 = atoms[b.atom1], atoms[b.atom2]
+        if a2.element.upper() == "H":
+            has_h_neighbor[b.atom1] = True
+        if a1.element.upper() == "H":
+            has_h_neighbor[b.atom2] = True
+    for i, a in enumerate(atoms):
+        if a.element.upper() in ("N", "O", "S"):
+            a.is_donor = has_h_neighbor[i]
+
+
 @dataclass
 class DockBond:
     atom1: int  # 0-indexed
@@ -217,6 +295,8 @@ class Mol2Parser:
                     except ValueError:
                         pass
 
+        _assign_donor_flags_from_bonds(atoms, bonds)
+        _assign_standard_residue_donor_fallback(atoms)
         return MolecularSystem(name=mol_name, atoms=atoms, bonds=bonds)
 
 
@@ -304,7 +384,13 @@ class SDFParser:
                 charge = float(atom.GetFormalCharge())
 
             is_acc = element in ["O", "N", "F"] and atom.GetFormalCharge() <= 0
-            is_don = element in ["N", "O"] and atom.GetTotalNumHs() > 0
+            # includeNeighbors=True is required: GetTotalNumHs() alone only
+            # reports the packed implicit/explicit-H *count* property and
+            # returns 0 once a molecule's hydrogens exist as explicit graph
+            # neighbor atoms (e.g. after Chem.AddHs()), silently finding
+            # zero donors -- same bug class already fixed in
+            # pharmacophore.py's find_ligand_pharma_features.
+            is_don = element in ["N", "O"] and atom.GetTotalNumHs(includeNeighbors=True) > 0
             is_pol = element in ["N", "O", "S", "P", "F", "CL"]
 
             atoms.append(
@@ -367,7 +453,12 @@ class PDBParser:
 
                     idx = len(atoms)
                     is_pol = element.upper() in ["N", "O", "S", "P", "F", "CL"]
-                    is_don = element.upper() in ["N", "O"] and "H" in name
+                    # Placeholder -- overwritten below by
+                    # _assign_donor_flags_from_bonds once every atom (and a
+                    # perceived bond graph) is available; the name-substring
+                    # check this used to use directly missed e.g. every
+                    # backbone amide N (PDB atom name is just "N").
+                    is_don = False
                     is_acc = element.upper() in ["O", "N"]
 
                     atoms.append(
@@ -389,4 +480,7 @@ class PDBParser:
                 except Exception:
                     continue
 
-        return MolecularSystem(name=mol_name, atoms=atoms)
+        bonds = _perceive_bonds_by_distance(atoms) if atoms else []
+        _assign_donor_flags_from_bonds(atoms, bonds)
+        _assign_standard_residue_donor_fallback(atoms)
+        return MolecularSystem(name=mol_name, atoms=atoms, bonds=bonds)

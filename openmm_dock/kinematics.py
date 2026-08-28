@@ -14,9 +14,40 @@ from rdkit.Geometry import Point3D
 import openmm as mm
 from openmm import unit
 
+import itertools
+
 from .core import MolecularSystem, DockAtom, SDFParser
 from .engine import DockingEngine, DockingResult
 from .kinematic_utils import toroidal_diff, find_downstream_atoms, identify_rotatable_bonds
+
+# Discrete rotamer libraries keyed by the hybridization of the two atoms
+# forming a rotatable bond -- a +/-20 degree, 5-point spread around each
+# staggered minimum for sp3-sp3 (Newman-projection 60/180/300 degrees, each
+# with 4 neighboring points so the library covers the WIDTH of each energy
+# well, not just its exact center), full 30 degree coverage for any bond
+# touching an sp2 center (a much shallower/less sharply-peaked rotational
+# barrier than sp3-sp3), and only the two planar minima for sp2-sp2 (e.g.
+# biaryl-type bonds). Values match those actually used in a real, published
+# rotamer-library conformer search (Salveson et al., Science 2024,
+# vector_dock_align.py's rotamer_dict) rather than a from-scratch guess.
+DISCRETE_ROTAMER_LIBRARY: Dict[Tuple[Chem.HybridizationType, Chem.HybridizationType], np.ndarray] = {
+    (Chem.HybridizationType.SP3, Chem.HybridizationType.SP3): np.radians(
+        [40.0, 50.0, 60.0, 70.0, 80.0, 160.0, 170.0, 180.0, 190.0, 200.0, 280.0, 290.0, 300.0, 310.0, 320.0]
+    ),
+    (Chem.HybridizationType.SP3, Chem.HybridizationType.SP2): np.radians(list(range(0, 360, 30))),
+    (Chem.HybridizationType.SP2, Chem.HybridizationType.SP2): np.radians([0.0, 180.0]),
+    (Chem.HybridizationType.SP3D, Chem.HybridizationType.SP3D): np.radians(
+        [40.0, 50.0, 60.0, 70.0, 80.0, 160.0, 170.0, 180.0, 190.0, 200.0, 280.0, 290.0, 300.0, 310.0, 320.0]
+    ),
+    (Chem.HybridizationType.SP3D, Chem.HybridizationType.SP3): np.radians(
+        [40.0, 50.0, 60.0, 70.0, 80.0, 160.0, 170.0, 180.0, 190.0, 200.0, 280.0, 290.0, 300.0, 310.0, 320.0]
+    ),
+    (Chem.HybridizationType.SP3D, Chem.HybridizationType.SP2): np.radians(list(range(0, 360, 30))),
+}
+# sp2-sp3 / sp3-sp2, sp2-sp3d / sp3d-sp2, and any UNSPECIFIED-hybridization
+# pairing are resolved by _rotamer_set_for_joint's symmetric lookup + this
+# fallback, matching the reference's own (mostly-symmetric-anyway) table.
+_DEFAULT_ROTAMER_SET = np.radians(list(range(0, 360, 30)))
 
 
 @dataclass
@@ -69,6 +100,15 @@ class LigandKinematicTree:
             ))
             
         self.num_torsions = len(self.joints)
+        self._island_decomposer: Optional[TorsionIslandDecomposer] = None
+
+    def get_island_decomposer(self) -> "TorsionIslandDecomposer":
+        """Lazily builds (and caches) this tree's TorsionIslandDecomposer --
+        island partitioning + rotamer enumeration cost is only paid once,
+        the first time clash-free swarm seeding is actually requested."""
+        if self._island_decomposer is None:
+            self._island_decomposer = TorsionIslandDecomposer(self)
+        return self._island_decomposer
 
     def _find_downstream_atoms(self, begin_idx: int, split_idx: int) -> List[int]:
         """Breadth-first search finding all atoms on the split_idx side of the cut."""
@@ -125,6 +165,174 @@ class LigandKinematicTree:
             p = coords_angstrom[i]
             conf.SetAtomPosition(i, Point3D(float(p[0]), float(p[1]), float(p[2])))
         return mol_out
+
+
+class TorsionIslandDecomposer:
+    """
+    Partitions a LigandKinematicTree's rotatable joints into independent
+    "islands" (groups of joints whose downstream subtrees overlap -- i.e.
+    joints along the same kinematic chain, since a joint further out on a
+    branch has a moving-atom set that is a strict subset of every ancestor
+    joint's own moving-atom set), enumerates a hybridization-aware discrete
+    rotamer library per joint, filters out self-clashing combinations
+    *within each island independently*, and combines islands to build
+    clash-free full-molecule dihedral vectors for swarm seeding.
+
+    Why per-island, not per-molecule: sampling all k rotatable bonds
+    independently and uniformly over [-pi, pi]^k wastes the overwhelming
+    majority of samples on severely self-clashing conformations for any
+    molecule with more than a handful of rotatable bonds (the product of k
+    independent uniform draws essentially never lands on a jointly sensible
+    combination). Rotating one joint is a rigid rotation of everything
+    downstream of it, which by definition cannot change any *internal*
+    pairwise distance within that downstream subtree -- so whether a given
+    branch clashes with itself depends only on that branch's own joints,
+    never on any other branch's or any ancestor's angle. That means each
+    branch's clash-free rotamer combinations can be enumerated and filtered
+    completely independently, in isolation, and then combined -- turning an
+    O(prod of all library sizes) search into a sum of much smaller
+    per-branch searches.
+    """
+
+    def __init__(self, tree: "LigandKinematicTree", clash_cutoff_angstrom: float = 1.2):
+        self.tree = tree
+        self.clash_cutoff = clash_cutoff_angstrom
+        self.islands: List[List[int]] = self._partition_islands()
+        self._island_valid_combos: Optional[List[np.ndarray]] = None
+
+    def _partition_islands(self) -> List[List[int]]:
+        """
+        Connected components of the "downstream subtree overlaps" graph,
+        via union-find. Doing this as a proper connected-components
+        computation (rather than a single greedy seed-vs-rest pass) matters
+        for correctness whenever two joints only share an ancestor without
+        directly overlapping each other -- e.g. two sibling branches B and C
+        that both descend from a joint A: B and C's own subtrees are
+        disjoint from each other (so a single seed-vs-rest pass starting
+        from B would never merge C into B's island), but both are subsets
+        of A's subtree, so a proper union over all pairs still correctly
+        merges {A, B, C} into one island via A acting as the connecting
+        pair, regardless of which joint happens to be visited first.
+        """
+        n = len(self.tree.joints)
+        subtree_sets = [set(j.moving_atom_indices) for j in self.tree.joints]
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if subtree_sets[i] & subtree_sets[j]:
+                    union(i, j)
+
+        groups: Dict[int, List[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        return list(groups.values())
+
+    def _rotamer_set_for_joint(self, j_idx: int) -> np.ndarray:
+        joint = self.tree.joints[j_idx]
+        h1 = self.tree.mol.GetAtomWithIdx(joint.begin_atom_idx).GetHybridization()
+        h2 = self.tree.mol.GetAtomWithIdx(joint.end_atom_idx).GetHybridization()
+        return (
+            DISCRETE_ROTAMER_LIBRARY.get((h1, h2))
+            if (h1, h2) in DISCRETE_ROTAMER_LIBRARY
+            else DISCRETE_ROTAMER_LIBRARY.get((h2, h1), _DEFAULT_ROTAMER_SET)
+        )
+
+    def _clash_free_combos_for_island(
+        self, island: List[int], rng: np.random.Generator, max_combos: int = 2000,
+    ) -> np.ndarray:
+        rotamer_sets = [self._rotamer_set_for_joint(j) for j in island]
+        # Compute the full product SIZE without ever materializing it: for
+        # an island of, say, 9 sp3-sp3 joints (15 angles each), the full
+        # itertools.product is 15**9 ~ 3.8e10 rows -- building that list (as
+        # an early version of this method did) OOM-kills the process well
+        # before the len(combos) > max_combos subsampling check ever runs.
+        # When the product is too large, sample max_combos *random* index
+        # tuples directly (one independent choice per joint) instead of
+        # ever enumerating the full space -- statistically equivalent to
+        # "generate everything, then subsample," at O(max_combos) memory
+        # instead of O(product size).
+        combo_count = 1
+        for rs in rotamer_sets:
+            combo_count *= len(rs)
+            if combo_count > max_combos:
+                break
+        if combo_count <= max_combos:
+            combos = np.array(list(itertools.product(*rotamer_sets)))
+        else:
+            combos = np.array([
+                [rs[rng.integers(len(rs))] for rs in rotamer_sets]
+                for _ in range(max_combos)
+            ])
+
+        # The union of every joint's own moving atoms in this island is
+        # exactly this island's own subtree extent (its "branch"); only
+        # pairwise distances within THIS set can possibly change as a
+        # function of THIS island's own joint angles (see class docstring).
+        moving_atoms = sorted(set().union(*(set(self.tree.joints[j].moving_atom_indices) for j in island)))
+        base_dofs = np.zeros(self.tree.num_torsions)
+
+        min_dists = np.full(len(combos), np.inf)
+        for c_idx, combo in enumerate(combos):
+            test_dofs = base_dofs.copy()
+            for k, j_idx in enumerate(island):
+                test_dofs[j_idx] = combo[k]
+            xyz = self.tree.forward_kinematics(np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]), test_dofs)
+            sub = xyz[moving_atoms]
+            if len(sub) > 1:
+                d = np.linalg.norm(sub[:, None, :] - sub[None, :, :], axis=-1)
+                np.fill_diagonal(d, np.inf)
+                min_dists[c_idx] = float(d.min())
+
+        clash_free = min_dists > self.clash_cutoff
+        if np.any(clash_free):
+            return combos[clash_free]
+        # Every discrete combination in this island clashes by the strict
+        # cutoff (rare, but possible for a very congested branch) -- fall
+        # back to the least-clashing decile rather than an arbitrary
+        # first-N slice, matching the reference algorithm's own fallback
+        # (vector_dock_align.py: falls back to the bottom 10th percentile
+        # of intramolecular LJ energy when no candidate clears its cutoff).
+        threshold = np.percentile(min_dists, 90.0)  # top 10% by distance = least clashing
+        return combos[min_dists >= threshold]
+
+    def _ensure_island_combos(self, rng: np.random.Generator) -> List[np.ndarray]:
+        if self._island_valid_combos is None:
+            self._island_valid_combos = [
+                self._clash_free_combos_for_island(island, rng) for island in self.islands
+            ]
+        return self._island_valid_combos
+
+    def sample_clash_free_dihedrals(self, num_samples: int = 100, seed: Optional[int] = None) -> np.ndarray:
+        """
+        Returns (num_samples, num_torsions) full-molecule dihedral vectors
+        (radians), each built by picking one clash-free rotamer combination
+        independently per island plus a small +/-5 degree jitter -- self-
+        consistent, chemically-sane starting torsions for swarm seeding,
+        in place of independent per-DOF uniform random sampling.
+        """
+        rng = np.random.default_rng(seed)
+        island_combos = self._ensure_island_combos(rng)
+        out = np.zeros((num_samples, self.tree.num_torsions))
+        jitter_scale = np.radians(5.0)
+        for s in range(num_samples):
+            for island, valid_combos in zip(self.islands, island_combos):
+                combo = valid_combos[rng.integers(len(valid_combos))]
+                jitter = rng.uniform(-jitter_scale, jitter_scale, size=len(island))
+                for k, j_idx in enumerate(island):
+                    out[s, j_idx] = combo[k] + jitter[k]
+        return out
 
 
 class KinematicDockingEngine:
@@ -270,17 +478,32 @@ class KinematicParticleSwarmOptimizer:
         w: float = 0.729,
         c1: float = 1.494,
         c2: float = 1.494,
-        ref_mol: Optional[Chem.Mol] = None
+        ref_mol: Optional[Chem.Mol] = None,
+        use_torsion_islands: bool = True,
     ) -> Tuple[Chem.Mol, float, List[Chem.Mol]]:
         """
         Executes Kinematic PSO and returns (best_mol, best_score, swarm_movie_frames).
+
+        use_torsion_islands: seed non-elite particles' initial torsions from
+        TorsionIslandDecomposer.sample_clash_free_dihedrals instead of
+        independent per-DOF uniform random sampling -- for a molecule with
+        more than a few rotatable bonds, independent uniform sampling wastes
+        the overwhelming majority of the initial swarm on severely self-
+        clashing starting conformations (see TorsionIslandDecomposer's
+        docstring for why per-branch enumeration avoids this).
         """
         particles: List[SwarmParticle] = []
         g_best_trans = np.zeros(3)
         g_best_rot = np.zeros(3)
         g_best_dihedrals = np.zeros(self.num_torsions)
         g_best_score = 9999999.0
-        
+
+        island_dihedral_seeds: Optional[np.ndarray] = None
+        if use_torsion_islands and self.num_torsions > 0:
+            island_dihedral_seeds = self.tree.get_island_decomposer().sample_clash_free_dihedrals(
+                num_samples=max(0, n_particles - 1)
+            )
+
         # 1. Initialize Swarm Particles with diverse random kinematic configurations
         for p_id in range(n_particles):
             if p_id == 0:
@@ -290,7 +513,11 @@ class KinematicParticleSwarmOptimizer:
             else:
                 t_init = np.random.uniform(-4.0, 4.0, 3)
                 r_init = np.random.uniform(-np.pi, np.pi, 3)
-                d_init = np.random.uniform(-np.pi, np.pi, self.num_torsions)
+                d_init = (
+                    island_dihedral_seeds[p_id - 1]
+                    if island_dihedral_seeds is not None
+                    else np.random.uniform(-np.pi, np.pi, self.num_torsions)
+                )
                 
             q_init = ScipyRotation.from_rotvec(r_init).as_quat()
             score, _ = self.kin_engine.evaluate_state(t_init, q_init, d_init)

@@ -38,6 +38,10 @@ import openmm as mm
 from .core import DockAtom, MolecularSystem
 from .cavity import CavityDefinition
 
+# ScoreWeights is imported lazily (inside HostGridPrescreen's methods, not
+# here) because scoring.py itself imports GridBox/create_boundary_penalty_force
+# from this module -- a top-level import here would be circular.
+
 # Standard ligand element types this module can grid. Matches DockAtom's
 # effective VDW typing in core.py: SDFParser.mol_to_system always assigns
 # ligand atoms sybyl_type=f"{element}.3", and VDW_PARAMS resolves that to
@@ -366,3 +370,132 @@ def create_boundary_penalty_force(
         force.addParticle(idx, [])
 
     return force
+
+
+class HostGridPrescreen:
+    """
+    Pure-numpy, OpenMM-free vectorized batch pose scorer over the SAME
+    dense grids compute_potential_grids already builds for the GPU search
+    path -- lets a GA/PSO/MC inner loop pre-screen thousands of candidate
+    poses per Python call via plain numpy fancy-indexing, with ZERO OpenMM
+    Context round-trips (not even a cheap one), keeping only the most
+    promising few for a real OpenMM evaluation. The real, authoritative
+    score always remains the OpenMM CustomNonbondedForce evaluation on
+    whichever candidates survive this filter -- this class exists purely to
+    cut down how many candidates ever reach that point.
+
+    Motivated by a real, published technique (Salveson et al., Science
+    2024, oligo-macs' virtual_screening_scripts/make_grid.py +
+    vector_dock_align.py): bit-pack a receptor potential into a hash table,
+    query it in one vectorized batch call per pose set. That reference
+    implementation depends on `getpy` (a C++ hash table with vectorized
+    numpy-array indexing) which is not published on PyPI for this
+    environment -- reimplementing an equivalent open-addressing hash table
+    from scratch would be substantial, risky, unnecessary duplication of a
+    focused external library, so this class takes a different, dependency-
+    free route to the same goal: since the grid is already on a REGULAR
+    lattice (GridBox), plain dense numpy array indexing gives genuinely O(1)
+    vectorized lookups without any hashing at all. It also deliberately
+    reuses this codebase's own existing rDock-style scoring channels
+    (compute_potential_grids' vdw/elec/hbdon/hbacc/hyd/repul grids, combined
+    with the same ScoreWeights used everywhere else in this repo) rather
+    than the reference's own different, unrelated set of empirical LJ/ES/
+    desolvation constants -- for a pre-screening filter that only needs to
+    correlate with, not exactly reproduce, the real score, consistency with
+    this repo's own physics is more valuable than fidelity to an unrelated
+    paper's parameterization.
+
+    Uses nearest-grid-point lookup (not trilinear interpolation) -- a
+    deliberate speed/accuracy tradeoff appropriate for a cheap ranking
+    filter, not the final answer.
+    """
+
+    def __init__(self, grids: Dict[str, np.ndarray], box: GridBox, weights: Optional[ScoreWeights] = None):
+        from .scoring import ScoreWeights  # deferred: see module-level circular-import note above
+
+        self.grids = grids
+        self.box = box
+        self.weights = weights or ScoreWeights()
+        self.inv_spacing = 1.0 / box.spacing_nm
+        self._shape_arr = np.array(box.shape, dtype=np.int64)
+
+    @classmethod
+    def build(
+        cls,
+        receptor: MolecularSystem,
+        cavity: CavityDefinition,
+        ligand_elements: List[str],
+        weights: Optional[ScoreWeights] = None,
+        ligand_margin_ang: float = 6.0,
+        spacing_ang: float = 0.375,
+    ) -> "HostGridPrescreen":
+        """Builds only the vdw_<ELEMENT> channels the given ligand actually
+        needs (its own distinct element set), not the full generic
+        STANDARD_VDW_ELEMENTS list -- e.g. a ligand with only C/N/O/S/F
+        atoms doesn't pay to precompute P/CL/BR/I channels it will never
+        query."""
+        box = GridBox.from_cavity(cavity, ligand_margin_ang=ligand_margin_ang, spacing_ang=spacing_ang)
+        distinct_elements = sorted({e.upper() for e in ligand_elements})
+        grids = compute_potential_grids(receptor, box, vdw_probe_types=distinct_elements)
+        return cls(grids, box, weights=weights)
+
+    def _grid_indices(self, coords_nm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """coords_nm: (..., 3) array of positions in nm. Returns (ix, iy, iz,
+        in_bounds), each shaped coords_nm.shape[:-1]."""
+        rel = (coords_nm - self.box.origin_nm) * self.inv_spacing
+        idx = np.round(rel).astype(np.int64)
+        in_bounds = np.all((idx >= 0) & (idx < self._shape_arr), axis=-1)
+        clipped = np.clip(idx, 0, self._shape_arr - 1)
+        return clipped[..., 0], clipped[..., 1], clipped[..., 2], in_bounds
+
+    def score_batch(
+        self,
+        batch_coords_nm: np.ndarray,   # (n_poses, n_atoms, 3), nm
+        elements: List[str],           # length n_atoms
+        charges: np.ndarray,           # (n_atoms,)
+        is_donor: np.ndarray,          # (n_atoms,) bool
+        is_acceptor: np.ndarray,       # (n_atoms,) bool
+        is_hyd: np.ndarray,            # (n_atoms,) bool
+        out_of_bounds_penalty: float = 50.0,
+    ) -> np.ndarray:
+        """
+        Returns (n_poses,) approximate interaction energy in kcal/mol.
+        Vectorizes over the POSES axis (typically thousands) inside a
+        Python loop over ATOMS (typically a few dozen for a drug-like
+        ligand) -- the loop runs over the small dimension, so every
+        iteration is one fully-batched numpy operation across every pose at
+        once, not a pose-by-pose or atom-by-atom Python-level score
+        accumulation.
+        """
+        n_poses, n_atoms, _ = batch_coords_nm.shape
+        ix, iy, iz, in_bounds = self._grid_indices(batch_coords_nm)
+        w = self.weights
+        total = np.zeros(n_poses)
+        elec_grid = self.grids.get("elec")
+        hbdon_grid = self.grids.get("hbdon")
+        hbacc_grid = self.grids.get("hbacc")
+        hyd_grid = self.grids.get("hyd")
+        repul_grid = self.grids.get("repul")
+
+        for a in range(n_atoms):
+            axi, ayi, azi = ix[:, a], iy[:, a], iz[:, a]
+            elem = elements[a].upper()
+            vdw_grid = self.grids.get(f"vdw_{elem}")
+
+            atom_energy = np.zeros(n_poses)
+            if vdw_grid is not None:
+                atom_energy += w.vdw * vdw_grid[axi, ayi, azi]
+            if elec_grid is not None:
+                atom_energy += w.polar * elec_grid[axi, ayi, azi] * charges[a]
+            if is_donor[a] and hbdon_grid is not None:
+                atom_energy += w.hbond * hbdon_grid[axi, ayi, azi]
+            if is_acceptor[a] and hbacc_grid is not None:
+                atom_energy += w.hbond * hbacc_grid[axi, ayi, azi]
+            if is_hyd[a] and hyd_grid is not None:
+                atom_energy += w.hydrophobic * hyd_grid[axi, ayi, azi]
+            if (is_donor[a] or is_acceptor[a]) and repul_grid is not None:
+                atom_energy += w.repul * repul_grid[axi, ayi, azi]
+
+            total += np.where(in_bounds[:, a], atom_energy, out_of_bounds_penalty)
+
+        return total

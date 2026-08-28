@@ -13,6 +13,9 @@ import numpy as np
 import openmm as mm
 from openmm import unit
 
+from rdkit import Chem
+
+from .core import MolecularSystem
 from .gridding import GridBox, create_boundary_penalty_force, STANDARD_VDW_ELEMENTS
 
 # Force group assignments for clean energy decomposition.
@@ -399,3 +402,245 @@ def create_grid_search_force(
         probe_params[t] = (probe.sigma, probe.epsilon)
 
     return GridSearchForces(vdw_forces, nonvdw_force, intra_force, boundary_force, probe_params)
+
+
+def create_gaussian_desolvation_force(
+    weight: float = 1.0,
+    cutoff_nm: float = 1.0,
+) -> mm.CustomNonbondedForce:
+    """
+    Continuous Gaussian implicit desolvation potential (Salveson et al.,
+    Science 2024, oligo-macs' make_grid.py) -- an ADDITIVE, opt-in
+    supplement to the existing contact hydrophobic/H-bond terms in
+    create_rdock_nonbonded_forces (GROUP_HYD), not a replacement: add this
+    force's return value to a System alongside the existing ones (the same
+    pattern create_covalent_bond_force and create_boundary_penalty_force
+    already use for optional terms) if you want it. Not wired into the
+    default create_rdock_nonbonded_forces/create_combined_search_force
+    pipeline automatically, so every existing demo's baseline scoring is
+    unaffected unless a caller explicitly opts in.
+
+    Real formula from the reference:
+        V_sol = -2.5 + 5.0*exp(-(2q)^2)
+                + 2.5 * sum_j (|q_i| + |q_j| - 0.6) * exp(-(r_ij - (r0_i+r0_j))^2)
+
+    Only the SECOND (pairwise sum) term is implemented here. The first term
+    is a function of a single atom's OWN charge alone -- not a pairwise
+    interaction at all, so it can't actually be expressed inside a
+    CustomNonbondedForce (the originating GitHub issue's own proposed
+    single-expression snippet folded both terms together, which silently
+    can't work: OpenMM has no way to see "this atom's charge" without a
+    second particle to pair it with inside a NonbondedForce expression). It
+    would need a separate CustomExternalForce to add correctly. It's also
+    scientifically irrelevant to omit for THIS codebase's use case: that
+    baseline term is IDENTICAL for every candidate pose of a given ligand
+    (charges don't change as the ligand moves), so it cannot affect pose
+    ranking during a docking search at all -- it only matters when
+    comparing the overall desolvation cost of DIFFERENT ligands (virtual
+    screening), which isn't what this codebase's search engines do.
+
+    r0 (atomic radius) is taken as HALF of each atom's existing VDW_PARAMS
+    sigma (sigma is the sum-of-radii/zero-crossing LJ distance, so half of
+    it approximates one atom's own radius) -- reuses this codebase's own
+    existing VDW parameterization rather than the reference's separate
+    r0_dict, for consistency with every other term in this module.
+
+    The exp(-100*(r-r0_sum)^2) form (vs. the reference's exp(-(r-r0_sum)^2))
+    is the SAME Gaussian, just written in OpenMM's native nanometers instead
+    of Angstroms: converting r, r0_sum from nm to the reference's Angstrom
+    convention multiplies their difference by 10, and squaring that
+    multiplies the exponent by 100 -- not a different, weaker/stronger
+    potential, the identical one in different length units.
+    """
+    energy_expr = (
+        "w_sol * 2.5 * (abs(q1) + abs(q2) - 0.6) * exp(-100.0 * (r - r0_sum)^2);"
+        "r0_sum = 0.5 * (sig1 + sig2)"
+    )
+    force = mm.CustomNonbondedForce(energy_expr)
+    force.addPerParticleParameter("q")
+    force.addPerParticleParameter("sig")
+    force.addGlobalParameter("w_sol", weight)
+    force.setNonbondedMethod(mm.CustomNonbondedForce.CutoffNonPeriodic)
+    force.setCutoffDistance(cutoff_nm * unit.nanometers)
+    force.setForceGroup(GROUP_HYD)
+    force.setName("GaussianDesolvationForce")
+    return force
+
+
+@dataclass
+class HBondFeatures:
+    """donor_pairs[i] = (heavy_donor_atom_idx, hydrogen_idx); acceptor_pairs[i]
+    = (antecedent_heavy_atom_idx, acceptor_atom_idx). Both (0, 2) int arrays
+    when a molecule has none of that feature type."""
+    donor_pairs: np.ndarray
+    acceptor_pairs: np.ndarray
+
+
+def extract_ligand_hbond_features(mol: "Chem.Mol") -> HBondFeatures:
+    """
+    Donor/acceptor + antecedent-atom extraction for a ligand RDKit Mol.
+    Uses GetTotalNumHs(includeNeighbors=True), not the bare
+    GetTotalNumHs() the original feature-request issue's own proposed code
+    used -- that packed-count property returns 0 once a molecule's
+    hydrogens exist as explicit graph-neighbor atoms (true for any molecule
+    that has been through Chem.AddHs(), which is common in this codebase's
+    own pipeline), silently finding zero donors. Same bug already fixed
+    once in pharmacophore.py's find_ligand_pharma_features and again in
+    core.py's SDFParser.mol_to_system -- fixed directly here too rather
+    than reproduced a third time.
+    """
+    donor_pairs: List[Tuple[int, int]] = []
+    acceptor_pairs: List[Tuple[int, int]] = []
+    for atom in mol.GetAtoms():
+        elem = atom.GetSymbol()
+        idx = atom.GetIdx()
+        if elem in ("N", "O") and atom.GetTotalNumHs(includeNeighbors=True) > 0:
+            for nbr in atom.GetNeighbors():
+                if nbr.GetSymbol() == "H":
+                    donor_pairs.append((idx, nbr.GetIdx()))
+        if elem in ("O", "N") and atom.GetFormalCharge() <= 0:
+            heavy_neighbors = [n.GetIdx() for n in atom.GetNeighbors() if n.GetSymbol() != "H"]
+            if heavy_neighbors:
+                acceptor_pairs.append((heavy_neighbors[0], idx))
+    return HBondFeatures(
+        donor_pairs=np.array(donor_pairs, dtype=np.int64) if donor_pairs else np.zeros((0, 2), dtype=np.int64),
+        acceptor_pairs=np.array(acceptor_pairs, dtype=np.int64) if acceptor_pairs else np.zeros((0, 2), dtype=np.int64),
+    )
+
+
+def extract_receptor_hbond_features(receptor: "MolecularSystem") -> HBondFeatures:
+    """
+    Same extraction against a DockAtom-based receptor MolecularSystem,
+    using its is_donor/is_acceptor flags (see core.py's
+    _assign_donor_flags_from_bonds / _assign_standard_residue_donor_fallback
+    -- fixed this session; previously these flags were wrong for most
+    standard-PDB-named atoms) plus its bond graph to find each donor's
+    attached hydrogen and each acceptor's heavy antecedent atom.
+    """
+    adjacency: Dict[int, List[int]] = {}
+    for b in receptor.bonds:
+        adjacency.setdefault(b.atom1, []).append(b.atom2)
+        adjacency.setdefault(b.atom2, []).append(b.atom1)
+
+    donor_pairs: List[Tuple[int, int]] = []
+    acceptor_pairs: List[Tuple[int, int]] = []
+    for i, a in enumerate(receptor.atoms):
+        if a.is_donor:
+            for j in adjacency.get(i, []):
+                if receptor.atoms[j].element.upper() == "H":
+                    donor_pairs.append((i, j))
+                    break
+        if a.is_acceptor:
+            heavy_neighbors = [j for j in adjacency.get(i, []) if receptor.atoms[j].element.upper() != "H"]
+            if heavy_neighbors:
+                acceptor_pairs.append((heavy_neighbors[0], i))
+    return HBondFeatures(
+        donor_pairs=np.array(donor_pairs, dtype=np.int64) if donor_pairs else np.zeros((0, 2), dtype=np.int64),
+        acceptor_pairs=np.array(acceptor_pairs, dtype=np.int64) if acceptor_pairs else np.zeros((0, 2), dtype=np.int64),
+    )
+
+
+class VectorizedDirectionalHBondScorer:
+    """
+    Pure-numpy, OpenMM-free directional hydrogen-bond scorer for batch pose
+    filtering/rescoring (companion to gridding.HostGridPrescreen -- this
+    codebase's existing contact H-bond bonus in create_rdock_nonbonded_forces
+    is purely distance-based, matching rDock's own RbtPolarIdxSF: a donor-H
+    pointing 90 degrees away from an acceptor scores identically to a
+    perfect, collinear 180-degree hydrogen bond. This class adds a genuine
+    directional term as an ADDITIONAL host-side filtering/rescoring signal,
+    not a replacement for the physical OpenMM score, which remains
+    authoritative -- matching HostGridPrescreen's own "cheap filter, real
+    OpenMM score still decides" design.
+
+    Math verified directly against the real reference source (Salveson et
+    al., Science 2024, oligo-macs' virtual_screening_scripts/vector_dock_align.py's
+    hbond_inter, not just the paraphrased version in the originating GitHub
+    issue -- confirmed to match): for a donor (heavy atom D, hydrogen H) and
+    acceptor (antecedent atom C, acceptor atom A):
+
+        r = |H -> A|                          (H...acceptor distance)
+        e = r - 2.0 Angstrom                  (offset from the ideal distance)
+        e *= 1.5 if e < 0                     (steeper penalty for too-close than too-far)
+        S_dist  = clip(1 - (e / 0.8)^2, 0, None)         (distance term, parabolic bump at r=2.0 A)
+        S_acc   = clip(-(C->A) . (H->A), 0, None)        (acceptor lone-pair alignment)
+        S_don   = clip((D->H) . (H->A), 0, None)         (donor linearity: D-H...A colinear is best)
+        E_hbond = -1 * S_dist^2 * S_acc * S_don^2
+
+    summed over every (donor, acceptor) pair between the two partners.
+    """
+
+    def __init__(self, weight: float = 1.0):
+        self.weight = weight
+
+    @staticmethod
+    def _hbond_energy(donor_coords: np.ndarray, acceptor_coords: np.ndarray) -> np.ndarray:
+        """
+        donor_coords: (n_poses, n_donors, 2, 3) -- [...,0,:]=heavy D, [...,1,:]=H
+        acceptor_coords: (n_poses, n_acceptors, 2, 3) -- [...,0,:]=antecedent C, [...,1,:]=acceptor A
+        Returns (n_poses,) summed directional H-bond energy, fully
+        vectorized over BOTH the pose axis and every donor x acceptor pair
+        in one call (no Python loop over poses) -- callers with one fixed
+        side (e.g. a static receptor) broadcast it to a matching pose axis
+        with np.broadcast_to before calling, so this method only ever needs
+        to handle the one, unambiguous (P, n, 2, 3) shape.
+        """
+        n_poses = donor_coords.shape[0]
+        if donor_coords.shape[1] == 0 or acceptor_coords.shape[1] == 0:
+            return np.zeros(n_poses)
+
+        d_heavy, d_h = donor_coords[..., 0, :], donor_coords[..., 1, :]      # (P, n_don, 3)
+        a_ante, a_acc = acceptor_coords[..., 0, :], acceptor_coords[..., 1, :]  # (P, n_acc, 3)
+
+        ray_ho = a_acc[:, None, :, :] - d_h[:, :, None, :]                   # (P, n_don, n_acc, 3): H -> A
+        dist = np.linalg.norm(ray_ho, axis=-1)                              # (P, n_don, n_acc)
+        ray_ho_unit = ray_ho / np.maximum(dist[..., None], 1e-6)
+
+        offset = dist - 2.0
+        offset = np.where(offset < 0, offset * 1.5, offset)
+        s_dist = np.clip(1.0 - (offset / 0.8) ** 2, 0.0, None)
+
+        ray_co = a_acc - a_ante                                             # (P, n_acc, 3): C -> A
+        ray_co_unit = ray_co / np.maximum(np.linalg.norm(ray_co, axis=-1, keepdims=True), 1e-6)
+        s_acc = np.clip(-np.einsum("pijk,pjk->pij", ray_ho_unit, ray_co_unit), 0.0, None)
+
+        ray_nh = d_h - d_heavy                                              # (P, n_don, 3): D -> H
+        ray_nh_unit = ray_nh / np.maximum(np.linalg.norm(ray_nh, axis=-1, keepdims=True), 1e-6)
+        s_don = np.clip(np.einsum("pijk,pik->pij", ray_ho_unit, ray_nh_unit), 0.0, None)
+
+        energy = -1.0 * (s_dist ** 2) * s_acc * (s_don ** 2)
+        return energy.sum(axis=(1, 2))
+
+    def score_batch(
+        self,
+        lig_coords_batch: np.ndarray,   # (n_poses, n_lig_atoms, 3)
+        lig_features: HBondFeatures,
+        rec_coords: np.ndarray,         # (n_rec_atoms, 3), fixed receptor
+        rec_features: HBondFeatures,
+    ) -> np.ndarray:
+        """Ligand-donor -> receptor-acceptor plus receptor-donor ->
+        ligand-acceptor, for every pose in one fully-vectorized call each
+        (no per-pose Python loop) -- the receptor's own fixed donor/acceptor
+        coordinates are broadcast across the pose axis via np.broadcast_to
+        (a view, not a copy, so this costs no extra memory)."""
+        n_poses = lig_coords_batch.shape[0]
+        total = np.zeros(n_poses)
+
+        n_rec_don, n_rec_acc = len(rec_features.donor_pairs), len(rec_features.acceptor_pairs)
+        rec_donor_xyz = (
+            np.broadcast_to(rec_coords[rec_features.donor_pairs], (n_poses, n_rec_don, 2, 3))
+            if n_rec_don else np.zeros((n_poses, 0, 2, 3))
+        )
+        rec_acc_xyz = (
+            np.broadcast_to(rec_coords[rec_features.acceptor_pairs], (n_poses, n_rec_acc, 2, 3))
+            if n_rec_acc else np.zeros((n_poses, 0, 2, 3))
+        )
+
+        if len(lig_features.donor_pairs):
+            lig_donor_xyz = lig_coords_batch[:, lig_features.donor_pairs]  # (P, n_lig_don, 2, 3)
+            total += self.weight * self._hbond_energy(lig_donor_xyz, rec_acc_xyz)
+        if len(lig_features.acceptor_pairs):
+            lig_acc_xyz = lig_coords_batch[:, lig_features.acceptor_pairs]  # (P, n_lig_acc, 2, 3)
+            total += self.weight * self._hbond_energy(rec_donor_xyz, lig_acc_xyz)
+
+        return total
